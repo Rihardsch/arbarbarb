@@ -58,7 +58,7 @@ const CLOB  = "https://clob.polymarket.com";
 const MYRIAD_BASE   = "https://api-production.polkamarkets.com/markets";
 const MYRIAD_PARAMS = "network_id=274133&state=open&land_ids=myriad-szn2-usdc-v33&per_page=100";
 
-// ---------- Proxy fetch (uses your Worker) with cache-bust + gentle 429 backoff
+// ---------- Proxy fetch (uses Worker)
 async function xfetch(url,{retries=4,backoff=500}={}){
   const bust=`_=${Date.now()}`;
   const proxied = `${PROXY}?url=${encodeURIComponent(url)}&${bust}`;
@@ -96,9 +96,9 @@ function escapeHtml(s){ return (s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'
 function setStatus(s){ statusEl.textContent=s; }
 function today(){ const d=new Date(); d.setHours(0,0,0,0); return d; }
 const nf = (x,dp=2)=> (x==null?'—':Number(x).toLocaleString(undefined,{maximumFractionDigits:dp}));
-const pf = (x,dp=2)=> (x==null?'—':Number(x).toFixed(dp));
+const pf = (x,dp=6)=> (x==null?'—':Number(x).toFixed(dp));
 
-// ---------- Polymarket loaders (via Worker)
+// ---------- Polymarket loaders
 async function fetchAllClobMarkets(){
   let cursor=""; const out=[];
   while(true){
@@ -160,7 +160,7 @@ async function loadPolymarket(){
   applyFilter();
 }
 
-// ---------- Myriad loader (via Worker) — adds outcomes
+// ---------- Myriad loader (robust) — stores outcomes if present
 async function loadMyriad(){
   const now = today();
   const perPage = 100;
@@ -175,7 +175,7 @@ async function loadMyriad(){
       setStatus(`Myriad: page ${pageNum} → ${chunk.length} markets`);
       if (!chunk.length) break;
       all.push(...chunk);
-      if (chunk.length < perPage) break;
+      if (chunk.length < perPage) break; // no more pages
       pageNum++;
       await new Promise(r => setTimeout(r, 80));
     }
@@ -196,6 +196,7 @@ async function loadMyriad(){
       liquidity: m.liquidity, volume: m.volume, volume24h: m.volume_24h,
       users: m.users, tokenSymbol: m?.token?.symbol || "",
       resolution_source: m.resolution_source || "",
+      // keep outcomes if list already provides them
       outcomes: Array.isArray(m.outcomes) ? m.outcomes : [],
       raw: m
     }))
@@ -249,7 +250,7 @@ function render(){
     const tdTok=document.createElement('td');
     if(m.src==="poly"){
       tdTok.innerHTML = `
-        <div class="muted">Best: ${m.bestBid!=null?pf(m.bestBid):'—'} / ${m.bestAsk!=null?pf(m.bestAsk):'—'}</div>
+        <div class="muted">Best: ${m.bestBid!=null?pf(m.bestBid,2):'—'} / ${m.bestAsk!=null?pf(m.bestAsk,2):'—'}</div>
         <div style="margin-top:6px;">
           <button data-load-tokens="${m.id}">Load options</button>
           <button data-view-json="${m.id}">View JSON</button>
@@ -352,20 +353,28 @@ async function viewBook(tokenId, host){
   }catch(e){ console.error(e); document.getElementById(`book-${tokenId}`).textContent="Failed to load book."; }
 }
 
-// ---------- Myriad options (price + shares + holders)
+// ---------- Myriad options (robust: list -> detail -> outcomes endpoint)
 async function loadMyriadOptions(marketId){
   const host = document.getElementById(`mopts-${marketId}`);
   if(!host) return;
   host.textContent = "Loading options…";
 
   try {
-    let m = BY_ID[String(marketId)];
-    let outcomes = Array.isArray(m?.outcomes) ? m.outcomes : [];
+    const m = BY_ID[String(marketId)] || {};
+    let outcomes = Array.isArray(m.outcomes) ? m.outcomes : [];
 
-    // Fallback: fetch details if the list payload had no outcomes
+    // Fallback 1: detail endpoint
     if (!outcomes.length) {
-      const detail = await xfetch(`${MYRIAD_BASE}/${marketId}`);
-      outcomes = Array.isArray(detail?.outcomes) ? detail.outcomes : [];
+      const detail = await xfetch(`${MYRIAD_BASE}/${marketId}?network_id=274133`);
+      const obj = detail && detail.data ? detail.data : detail;
+      if (Array.isArray(obj?.outcomes)) outcomes = obj.outcomes;
+    }
+
+    // Fallback 2: explicit outcomes endpoint (some deployments expose this)
+    if (!outcomes.length) {
+      const maybe = await xfetch(`${MYRIAD_BASE}/${marketId}/outcomes?network_id=274133`);
+      const arr = Array.isArray(maybe) ? maybe : (Array.isArray(maybe?.data) ? maybe.data : []);
+      if (arr.length) outcomes = arr;
     }
 
     if (!outcomes.length) {
@@ -382,13 +391,12 @@ async function loadMyriadOptions(marketId){
     const body = tbl.querySelector('tbody');
 
     for (const o of outcomes) {
+      const title = o.title || o.name || `Outcome ${o.id ?? ''}`.trim();
+      const price = pf(o.price, 6);
+      const shares = nf(o.shares ?? o.shares_held, 4);
+      const holders = o.holders != null ? Number(o.holders).toLocaleString() : '—';
       const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td>${escapeHtml(o.title || `Outcome ${o.id}`)}</td>
-        <td>${pf(o.price, 6)}</td>
-        <td>${nf(o.shares, 4)}</td>
-        <td>${o.holders != null ? Number(o.holders).toLocaleString() : '—'}</td>
-      `;
+      tr.innerHTML = `<td>${escapeHtml(title)}</td><td>${price}</td><td>${shares}</td><td>${holders}</td>`;
       body.appendChild(tr);
     }
 
