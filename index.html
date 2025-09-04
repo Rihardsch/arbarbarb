@@ -26,6 +26,15 @@
 <div class="controls">
   <label>Filter: <input id="q" placeholder="type to filter by question/slug" /></label>
   <label>Only active: <input id="onlyActive" type="checkbox" checked /></label>
+  <label>Since:
+    <select id="sinceDays">
+      <option value="30">30 days</option>
+      <option value="90">90 days</option>
+      <option value="180" selected>180 days</option>
+      <option value="365">365 days</option>
+      <option value="all">All time</option>
+    </select>
+  </label>
   <label>Page size:
     <select id="pageSize"><option>25</option><option>50</option><option selected>100</option><option>200</option></select>
   </label>
@@ -46,7 +55,7 @@
 
 <script>
 // --- config ---
-const PROXY = "https://arbarbarb.rihardschnr2.workers.dev/"; // <-- your Cloudflare Worker URL
+const PROXY = "https://arbarbarb.rihardschnr2.workers.dev"; // your Cloudflare Worker
 const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB  = "https://clob.polymarket.com";
 
@@ -57,9 +66,10 @@ async function xfetch(url){
   return r.json();
 }
 
-let ALL=[], VIEW=[], page=0;
+let RAW=[], ALL=[], VIEW=[], page=0;
 const qEl=document.getElementById('q');
 const onlyActiveEl=document.getElementById('onlyActive');
+const sinceEl=document.getElementById('sinceDays');
 const pageSizeEl=document.getElementById('pageSize');
 const statusEl=document.getElementById('status');
 const tbody=document.getElementById('tbody');
@@ -70,23 +80,27 @@ document.getElementById('prevBtn').onclick = () => { if (page>0){ page--; render
 document.getElementById('nextBtn').onclick = () => { if ((page+1)*pageSize() < VIEW.length){ page++; render(); } };
 qEl.oninput = applyFilter;
 onlyActiveEl.onchange = applyFilter;
+sinceEl.onchange = applyFilter;
 pageSizeEl.onchange = () => { page=0; render(); };
 
 function pageSize(){ return parseInt(pageSizeEl.value,10)||100; }
+function parseIso(s){ const d = s ? new Date(s) : null; return isFinite(d) ? d : null; }
+function daysAgo(n){ const d = new Date(); d.setDate(d.getDate()-n); return d; }
+
+// choose the best date to filter/sort on
+function marketDate(m){
+  // prefer end date, else start/created if present, else null
+  return parseIso(m.endDateIso) || parseIso(m.startDateIso) || parseIso(m.createdAt) || null;
+}
 
 async function loadMarkets(){
   setStatus("Loading markets…");
   try {
     const data = await xfetch(`${GAMMA}/markets`);
-    ALL = data.map(m => ({
-      id: m.id,
-      question: m.question,
-      slug: m.slug,
-      active: !!m.active,
-      endDateIso: m.endDateIso,
-      marketType: m.marketType,
-    }));
-    setStatus(`Loaded ${ALL.length} markets.`);
+    // keep raw for re-filtering without re-fetch
+    RAW = data;
+    normalizeAndFilter();
+    setStatus(`Loaded ${ALL.length} markets (after recency filter).`);
     applyFilter();
   } catch (e) {
     console.error(e);
@@ -94,14 +108,44 @@ async function loadMarkets(){
   }
 }
 
+function normalizeAndFilter(){
+  const sinceVal = sinceEl.value;
+  const cutoff = sinceVal === "all" ? null : daysAgo(parseInt(sinceVal,10));
+
+  // normalize and apply recency window
+  ALL = RAW.map(m => ({
+      id: m.id,
+      question: m.question,
+      slug: m.slug,
+      active: !!m.active,
+      endDateIso: m.endDateIso,
+      startDateIso: m.startDateIso || m.startDate || null,
+      createdAt: m.createdAt || null,
+      marketType: m.marketType,
+    }))
+    .filter(m => {
+      if (!cutoff) return true;
+      const d = marketDate(m);
+      return d ? d >= cutoff : false;
+    })
+    // sort newest first by the chosen date
+    .sort((a,b) => {
+      const da = marketDate(a)?.getTime() || 0;
+      const db = marketDate(b)?.getTime() || 0;
+      return db - da;
+    });
+}
+
 function applyFilter(){
   const q=(qEl.value||"").toLowerCase();
   const onlyActive=onlyActiveEl.checked;
+
   VIEW = ALL.filter(m => {
     if (onlyActive && !m.active) return false;
     const text = `${m.question} ${m.slug}`.toLowerCase();
     return text.includes(q);
   });
+
   page=0; render();
 }
 
@@ -113,8 +157,10 @@ function render(){
     const tr=document.createElement('tr');
 
     const tdQ=document.createElement('td');
+    const d = marketDate(m);
+    const dateTxt = d ? new Intl.DateTimeFormat(undefined,{year:'numeric',month:'short',day:'numeric'}).format(d) : '';
     tdQ.innerHTML = `<div>${escapeHtml(m.question)} ${m.active?'<span class="chip">active</span>':''}</div>
-                     <div class="muted">${escapeHtml(m.slug||'')}</div>`;
+                     <div class="muted">${escapeHtml(m.slug||'')} ${dateTxt?` · ends ${dateTxt}`:''}</div>`;
     tr.appendChild(tdQ);
 
     const tdId=document.createElement('td');
@@ -130,7 +176,7 @@ function render(){
 
     tbody.appendChild(tr);
   }
-  pageInfo.textContent = `Page ${VIEW.length ? page+1 : 0} of ${Math.ceil(VIEW.length/ps)} — ${VIEW.length} shown${VIEW.length!==ALL.length?` (filtered from ${ALL.length})`:''}`;
+  pageInfo.textContent = `Page ${VIEW.length ? page+1 : 0} of ${Math.ceil(VIEW.length/ps)} — ${VIEW.length} shown`;
   tbody.querySelectorAll('button[data-load-tokens]').forEach(btn=>{
     btn.onclick = () => loadTokens(btn.getAttribute('data-load-tokens'));
   });
@@ -143,7 +189,6 @@ async function loadTokens(marketId){
   host.textContent = "Loading options…";
   try {
     const detail = await xfetch(`${CLOB}/markets/${marketId}`);
-    // expect something like { tokens: [{ id, name/label, ... }, ...] }
     const tokens = (detail?.tokens || []).map(t => ({
       id: t.id || t.token_id,
       label: t.name || t.label || t.ticker || t.outcome || 'Outcome',
@@ -154,7 +199,6 @@ async function loadTokens(marketId){
       return;
     }
 
-    // build a mini table
     const tbl = document.createElement('table');
     tbl.className = 'mini';
     tbl.innerHTML = `
@@ -163,7 +207,6 @@ async function loadTokens(marketId){
     `;
     const body = tbl.querySelector('tbody');
 
-    // fill rows and fetch best prices for each token
     for (const t of tokens){
       const tr = document.createElement('tr');
       tr.innerHTML = `
@@ -175,7 +218,6 @@ async function loadTokens(marketId){
       `;
       body.appendChild(tr);
 
-      // fetch book for best bid/ask
       xfetch(`${CLOB}/book?token_id=${encodeURIComponent(t.id)}`)
         .then(book => {
           document.getElementById(`bb-${t.id}`).textContent = book?.bids?.[0]?.price?.toFixed(4) ?? '—';
@@ -190,7 +232,6 @@ async function loadTokens(marketId){
     host.innerHTML = "";
     host.appendChild(tbl);
 
-    // hook up "View book" buttons
     host.querySelectorAll('button[data-view-book]').forEach(btn=>{
       btn.onclick = () => viewBook(btn.getAttribute('data-view-book'), host);
     });
@@ -201,12 +242,10 @@ async function loadTokens(marketId){
   }
 }
 
-// show a full ladder for a token below the table
+// full ladder for a token
 async function viewBook(tokenId, host){
-  // if a details element for this token already exists, toggle it
   let existing = document.getElementById(`bookwrap-${tokenId}`);
   if (existing){ existing.open = !existing.open; return; }
-
   const det = document.createElement('details');
   det.id = `bookwrap-${tokenId}`;
   det.open = true;
@@ -215,12 +254,11 @@ async function viewBook(tokenId, host){
 
   try{
     const book = await xfetch(`${CLOB}/book?token_id=${encodeURIComponent(tokenId)}`);
-    const bids = (book?.bids || []).slice(0, 15).map(b => `${fmt(b.price)} @ ${fmt(b.size)}`).join('<br/>') || '—';
-    const asks = (book?.asks || []).slice(0, 15).map(a => `${fmt(a.price)} @ ${fmt(a.size)}`).join('<br/>') || '—';
+    const bids = (book?.bids||[]).slice(0,15).map(b=>`${fmt(b.price)} @ ${fmt(b.size)}`).join('<br/>') || '—';
+    const asks = (book?.asks||[]).slice(0,15).map(a=>`${fmt(a.price)} @ ${fmt(a.size)}`).join('<br/>') || '—';
     document.getElementById(`book-${tokenId}`).innerHTML = `
       <div><b>Bids (top 15)</b><br/>${bids}</div>
-      <div><b>Asks (top 15)</b><br/>${asks}</div>
-    `;
+      <div><b>Asks (top 15)</b><br/>${asks}</div>`;
   }catch(e){
     console.error(e);
     document.getElementById(`book-${tokenId}`).textContent = "Failed to load book.";
