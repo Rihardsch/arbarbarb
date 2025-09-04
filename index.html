@@ -13,22 +13,15 @@
   th,td { border-bottom:1px solid #ddd; padding:8px; text-align:left; vertical-align:top; }
   .muted{ opacity:.7; font-size:12px; }
   .token{ display:inline-block; font-family:ui-monospace,Menlo,monospace; font-size:12px; background:#f5f5f5; padding:2px 6px; border-radius:6px; margin:2px 4px 2px 0; }
-  details{ margin-top:6px; }
-  .ladder{ display:grid; grid-template-columns:100px 100px; gap:6px; margin-top:6px; }
   .chip{ display:inline-block; padding:2px 6px; border-radius:999px; background:#eef; font-size:12px; margin-left:6px; }
-  #diag{ background:#fffbe6; border:1px solid #f0e6aa; padding:8px; margin:12px 0; font-size:12px; }
-  #diag pre{ white-space: pre-wrap; margin:0; }
+  .ladder{ display:grid; grid-template-columns:120px 120px; gap:10px; margin-top:6px; }
+  .mini { font-size:12px; width:100%; border-collapse: collapse; margin-top:4px; }
+  .mini th,.mini td{ border-bottom:1px dashed #eee; padding:4px 6px; }
+  details { margin-top:6px; }
 </style>
 </head>
 <body>
 <h1>Polymarket Explorer <span class="muted">(markets + order books)</span></h1>
-
-<div id="diag">
-  <b>Diagnostics</b> —
-  <button id="testWorker">Test proxy</button>
-  <span id="diagMsg" class="muted"></span>
-  <pre id="diagOut"></pre>
-</div>
 
 <div class="controls">
   <label>Filter: <input id="q" placeholder="type to filter by question/slug" /></label>
@@ -40,8 +33,8 @@
   <span id="status" class="muted"></span>
 </div>
 
-<table id="tbl">
-  <thead><tr><th>Question</th><th>Market ID</th><th>Tokens</th></tr></thead>
+<table>
+  <thead><tr><th>Question</th><th>Market ID</th><th>Tokens / Prices</th></tr></thead>
   <tbody id="tbody"></tbody>
 </table>
 
@@ -52,31 +45,17 @@
 </div>
 
 <script>
-const PROXY = "https://arbarbarb.rihardschnr2.workers.dev/"; // <-- put your Worker URL
+// --- config ---
+const PROXY = "https://arbarbarb.rihardschnr2.workers.dev/"; // <-- your Cloudflare Worker URL
 const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB  = "https://clob.polymarket.com";
 
+// proxy fetch helper
 async function xfetch(url){
   const r = await fetch(`${PROXY}?url=${encodeURIComponent(url)}`);
   if (!r.ok) throw new Error(`Proxy HTTP ${r.status}`);
   return r.json();
 }
-
-// --- diagnostics ---
-const diagMsg = document.getElementById('diagMsg');
-const diagOut = document.getElementById('diagOut');
-document.getElementById('testWorker').onclick = async () => {
-  diagMsg.textContent = "testing…";
-  diagOut.textContent = "";
-  try {
-    const j = await xfetch(`${GAMMA}/markets`);
-    diagMsg.textContent = "proxy OK (Gamma)";
-    diagOut.textContent = `received ${Array.isArray(j)? j.length : (j?.markets?.length ?? '?')} items`;
-  } catch (e) {
-    diagMsg.textContent = "proxy FAILED";
-    diagOut.textContent = String(e);
-  }
-};
 
 let ALL=[], VIEW=[], page=0;
 const qEl=document.getElementById('q');
@@ -96,7 +75,7 @@ pageSizeEl.onchange = () => { page=0; render(); };
 function pageSize(){ return parseInt(pageSizeEl.value,10)||100; }
 
 async function loadMarkets(){
-  setStatus("Loading markets (via proxy) …");
+  setStatus("Loading markets…");
   try {
     const data = await xfetch(`${GAMMA}/markets`);
     ALL = data.map(m => ({
@@ -105,14 +84,13 @@ async function loadMarkets(){
       slug: m.slug,
       active: !!m.active,
       endDateIso: m.endDateIso,
-      clobTokenIds: Array.isArray(m.clobTokenIds) ? m.clobTokenIds : [],
       marketType: m.marketType,
     }));
     setStatus(`Loaded ${ALL.length} markets.`);
     applyFilter();
   } catch (e) {
     console.error(e);
-    setStatus("Failed to load markets (proxy). Open Diagnostics → Test proxy.");
+    setStatus("Failed to load markets.");
   }
 }
 
@@ -133,60 +111,120 @@ function render(){
   const slice = VIEW.slice(page*ps, page*ps+ps);
   for (const m of slice){
     const tr=document.createElement('tr');
+
     const tdQ=document.createElement('td');
-    tdQ.innerHTML = `<div>${escapeHtml(m.question)} ${m.active?'<span class="chip">active</span>':''}</div><div class="muted">${escapeHtml(m.slug||'')}</div>`;
+    tdQ.innerHTML = `<div>${escapeHtml(m.question)} ${m.active?'<span class="chip">active</span>':''}</div>
+                     <div class="muted">${escapeHtml(m.slug||'')}</div>`;
     tr.appendChild(tdQ);
 
-    const tdId=document.createElement('td'); tdId.textContent=m.id; tr.appendChild(tdId);
+    const tdId=document.createElement('td');
+    tdId.textContent=m.id;
+    tr.appendChild(tdId);
 
     const tdTok=document.createElement('td');
-    if (!m.clobTokenIds.length) { tdTok.textContent="—"; }
-    else {
-      const container=document.createElement('div');
-      m.clobTokenIds.forEach(tid=>{
-        const wrap=document.createElement('div');
-        wrap.innerHTML = `
-          <span class="token">${tid}</span>
-          <button data-tok="${tid}">Load book</button>
-          <details><summary class="muted">book</summary><div class="book" id="book-${tid}">—</div></details>
-        `;
-        container.appendChild(wrap);
-      });
-      tdTok.appendChild(container);
-    }
+    tdTok.innerHTML = `
+      <button data-load-tokens="${m.id}">Load options</button>
+      <div id="tokens-${m.id}" class="muted" style="margin-top:6px;">—</div>
+    `;
     tr.appendChild(tdTok);
+
     tbody.appendChild(tr);
   }
   pageInfo.textContent = `Page ${VIEW.length ? page+1 : 0} of ${Math.ceil(VIEW.length/ps)} — ${VIEW.length} shown${VIEW.length!==ALL.length?` (filtered from ${ALL.length})`:''}`;
-  tbody.querySelectorAll('button[data-tok]').forEach(btn=>{
-    btn.onclick=()=>loadBook(btn.getAttribute('data-tok'));
+  tbody.querySelectorAll('button[data-load-tokens]').forEach(btn=>{
+    btn.onclick = () => loadTokens(btn.getAttribute('data-load-tokens'));
   });
 }
 
-async function loadBook(tokenId){
-  const target=document.getElementById(`book-${tokenId}`);
-  if (!target) return;
-  target.textContent="Loading…";
-  try{
-    const book = await xfetch(`${CLOB}/book?token_id=${encodeURIComponent(tokenId)}`);
-    target.innerHTML = renderBook(book);
-  }catch(e){
+// fetch all tokens/outcomes for a market and show best bid/ask
+async function loadTokens(marketId){
+  const host = document.getElementById(`tokens-${marketId}`);
+  if (!host) return;
+  host.textContent = "Loading options…";
+  try {
+    const detail = await xfetch(`${CLOB}/markets/${marketId}`);
+    // expect something like { tokens: [{ id, name/label, ... }, ...] }
+    const tokens = (detail?.tokens || []).map(t => ({
+      id: t.id || t.token_id,
+      label: t.name || t.label || t.ticker || t.outcome || 'Outcome',
+    }));
+
+    if (!tokens.length){
+      host.textContent = "No tokens found for this market.";
+      return;
+    }
+
+    // build a mini table
+    const tbl = document.createElement('table');
+    tbl.className = 'mini';
+    tbl.innerHTML = `
+      <thead><tr><th>Outcome</th><th>Token</th><th>Best bid</th><th>Best ask</th><th></th></tr></thead>
+      <tbody></tbody>
+    `;
+    const body = tbl.querySelector('tbody');
+
+    // fill rows and fetch best prices for each token
+    for (const t of tokens){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${escapeHtml(t.label)}</td>
+        <td><span class="token">${t.id}</span></td>
+        <td id="bb-${t.id}" class="muted">…</td>
+        <td id="ba-${t.id}" class="muted">…</td>
+        <td><button data-view-book="${t.id}">View book</button></td>
+      `;
+      body.appendChild(tr);
+
+      // fetch book for best bid/ask
+      xfetch(`${CLOB}/book?token_id=${encodeURIComponent(t.id)}`)
+        .then(book => {
+          document.getElementById(`bb-${t.id}`).textContent = book?.bids?.[0]?.price?.toFixed(4) ?? '—';
+          document.getElementById(`ba-${t.id}`).textContent = book?.asks?.[0]?.price?.toFixed(4) ?? '—';
+        })
+        .catch(_ => {
+          document.getElementById(`bb-${t.id}`).textContent = '—';
+          document.getElementById(`ba-${t.id}`).textContent = '—';
+        });
+    }
+
+    host.innerHTML = "";
+    host.appendChild(tbl);
+
+    // hook up "View book" buttons
+    host.querySelectorAll('button[data-view-book]').forEach(btn=>{
+      btn.onclick = () => viewBook(btn.getAttribute('data-view-book'), host);
+    });
+
+  } catch (e) {
     console.error(e);
-    target.textContent="Failed to load book.";
+    host.textContent = "Failed to load options for this market.";
   }
 }
 
-function renderBook(book){
-  const bestBid=book?.bids?.[0]?.price ?? null;
-  const bestAsk=book?.asks?.[0]?.price ?? null;
-  const bids=(book?.bids||[]).slice(0,10).map(b=>`${fmt(b.price)} @ ${fmt(b.size)}`).join('<br/>');
-  const asks=(book?.asks||[]).slice(0,10).map(a=>`${fmt(a.price)} @ ${fmt(a.size)}`).join('<br/>');
-  return `
-    <div>best bid: <b>${bestBid==null?'-':fmt(bestBid)}</b> | best ask: <b>${bestAsk==null?'-':fmt(bestAsk)}</b></div>
-    <div class="ladder">
-      <div><b>Bids (top 10)</b><br/>${bids||'—'}</div>
-      <div><b>Asks (top 10)</b><br/>${asks||'—'}</div>
-    </div>`;
+// show a full ladder for a token below the table
+async function viewBook(tokenId, host){
+  // if a details element for this token already exists, toggle it
+  let existing = document.getElementById(`bookwrap-${tokenId}`);
+  if (existing){ existing.open = !existing.open; return; }
+
+  const det = document.createElement('details');
+  det.id = `bookwrap-${tokenId}`;
+  det.open = true;
+  det.innerHTML = `<summary>Order book for ${tokenId}</summary><div id="book-${tokenId}" class="ladder">Loading…</div>`;
+  host.appendChild(det);
+
+  try{
+    const book = await xfetch(`${CLOB}/book?token_id=${encodeURIComponent(tokenId)}`);
+    const bids = (book?.bids || []).slice(0, 15).map(b => `${fmt(b.price)} @ ${fmt(b.size)}`).join('<br/>') || '—';
+    const asks = (book?.asks || []).slice(0, 15).map(a => `${fmt(a.price)} @ ${fmt(a.size)}`).join('<br/>') || '—';
+    document.getElementById(`book-${tokenId}`).innerHTML = `
+      <div><b>Bids (top 15)</b><br/>${bids}</div>
+      <div><b>Asks (top 15)</b><br/>${asks}</div>
+    `;
+  }catch(e){
+    console.error(e);
+    document.getElementById(`book-${tokenId}`).textContent = "Failed to load book.";
+  }
 }
 
 function fmt(x){ return Number(x).toFixed(4); }
