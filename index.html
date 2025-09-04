@@ -52,10 +52,25 @@
 
 <script>
 // ---------- Config
+const PROXY = "https://arbarbarb.rihardschnr2.workers.dev/"; // your Cloudflare Worker
 const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB  = "https://clob.polymarket.com";
 const MYRIAD_BASE   = "https://api-production.polkamarkets.com/markets";
 const MYRIAD_PARAMS = "network_id=274133&state=open&land_ids=myriad-szn2-usdc-v33&per_page=100";
+
+// ---------- Proxy fetch (uses your Worker) with cache-bust + gentle 429 backoff
+async function xfetch(url,{retries=4,backoff=500}={}){
+  const bust=`_=${Date.now()}`;
+  const proxied = `${PROXY}?url=${encodeURIComponent(url)}&${bust}`;
+  for(let a=0;a<retries;a++){
+    const r = await fetch(proxied, { method:"GET", cache:"no-store" });
+    if(r.status===429){ await new Promise(res=>setTimeout(res, backoff*(2**a))); continue; }
+    if(!r.ok) throw new Error(`Proxy HTTP ${r.status} for ${url}`);
+    const ct = r.headers.get("content-type")||"";
+    return ct.includes("application/json") ? r.json() : r.text();
+  }
+  throw new Error(`Retry limit reached for ${url}`);
+}
 
 // ---------- State
 let RAW=[], VIEW=[], BY_ID={}, page=0;
@@ -72,9 +87,7 @@ document.getElementById('prevBtn').onclick = () => { if (page>0){ page--; render
 document.getElementById('nextBtn').onclick = () => { if ((page+1)*pageSize() < VIEW.length){ page++; render(); } };
 qEl.oninput = applyFilter;
 pageSizeEl.onchange = () => { page=0; render(); };
-sourceEl.onchange = () => {
-  setStatus(`Source set to ${sourceEl.value === 'poly' ? 'Polymarket' : 'Myriad'} — press Refresh to load.`);
-};
+sourceEl.onchange = () => setStatus(`Source set to ${sourceEl.value === 'poly' ? 'Polymarket' : 'Myriad'} — press Refresh to load.`);
 
 // ---------- Utils
 function pageSize(){ return parseInt(pageSizeEl.value,10)||100; }
@@ -83,19 +96,17 @@ function escapeHtml(s){ return (s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'
 function setStatus(s){ statusEl.textContent=s; }
 function today(){ const d=new Date(); d.setHours(0,0,0,0); return d; }
 
-// ---------- Polymarket loaders
+// ---------- Polymarket loaders (via Worker)
 async function fetchAllClobMarkets(){
   let cursor=""; const out=[];
   while(true){
     const url=`${CLOB}/markets${cursor?`?next_cursor=${encodeURIComponent(cursor)}`:""}`;
-    const r=await fetch(url);
-    if(!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data=await r.json();
-    const arr=data?.data||[];
+    const data = await xfetch(url);
+    const arr = data?.data || [];
     out.push(...arr);
-    cursor=data?.next_cursor;
+    cursor = data?.next_cursor;
     setStatus(`Polymarket CLOB: ${out.length} markets loaded…`);
-    if(!cursor||cursor==="LTE=") break;
+    if(!cursor || cursor==="LTE=") break;
     await new Promise(r=>setTimeout(r,200));
   }
   return out;
@@ -104,9 +115,7 @@ async function fetchAllGammaOpen(){
   const limit=1000; let offset=0; const out=[];
   while(true){
     const url=`${GAMMA}/markets?closed=false&limit=${limit}&offset=${offset}`;
-    const r=await fetch(url);
-    if(!r.ok) throw new Error(`HTTP ${r.status}`);
-    const chunk=await r.json();
+    const chunk = await xfetch(url);
     if(!Array.isArray(chunk)||chunk.length===0) break;
     out.push(...chunk);
     offset+=chunk.length;
@@ -149,37 +158,23 @@ async function loadPolymarket(){
   applyFilter();
 }
 
-// ---------- Myriad loader (direct fetch, no Worker)
-async function fetchDirectJson(url) {
-  const r = await fetch(url, {mode:"cors",cache:"no-store",headers:{"Accept":"application/json"}});
-  if(!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json();
-}
+// ---------- Myriad loader (via Worker) — same pattern as Polymarket
 async function loadMyriad(){
   const now=today();
   const perPage=100;
   let pageNum=1;
   const all=[];
 
-  try {
-    while(true){
-      const url=`${MYRIAD_BASE}?${MYRIAD_PARAMS}&page=${pageNum}`;
-      const resp=await fetchDirectJson(url);
-      const chunk=Array.isArray(resp)?resp:(Array.isArray(resp?.data)?resp.data:[]);
-      setStatus(`Myriad: page ${pageNum} → ${chunk.length} markets`);
-      if(!chunk.length) break;
-      all.push(...chunk);
-      if(chunk.length<perPage) break;
-      pageNum++;
-    }
-  } catch(e) {
-    if(e instanceof TypeError){
-      setStatus("Myriad fetch blocked by CORS.");
-    } else {
-      setStatus(`Myriad fetch failed: ${e.message}`);
-    }
-    console.error(e);
-    return;
+  while(true){
+    const url = `${MYRIAD_BASE}?${MYRIAD_PARAMS}&page=${pageNum}`;
+    const resp = await xfetch(url);
+    const chunk = Array.isArray(resp) ? resp : (Array.isArray(resp?.data) ? resp.data : []);
+    setStatus(`Myriad: page ${pageNum} → ${chunk.length} markets`);
+    if (!chunk.length) break;
+    all.push(...chunk);
+    if (chunk.length < perPage) break;
+    pageNum++;
+    await new Promise(r=>setTimeout(r,80));
   }
 
   RAW = all
@@ -202,34 +197,36 @@ async function loadMyriad(){
     });
 
   BY_ID = Object.fromEntries(RAW.map(m=>[String(m.id), m]));
-  setStatus(`Myriad: ${RAW.length} open, unexpired markets (direct fetch).`);
+  setStatus(`Myriad: ${RAW.length} open, unexpired markets.`);
   applyFilter();
 }
 
-// ---------- Master loader
+// ---------- Master loader (manual only)
 async function load(){
   setStatus("Loading…");
-  try {
+  try{
     if(sourceEl.value==="poly"){ await loadPolymarket(); }
     else { await loadMyriad(); }
-  } catch(e){
+  }catch(e){
     console.error(e);
-    setStatus("Failed to load.");
+    setStatus(`Failed to load: ${e?.message||e}`);
   }
 }
 
 // ---------- Filter + render
 function applyFilter(){
   const q=(qEl.value||"").toLowerCase();
-  VIEW = RAW.filter(m => (`${m.question} ${m.slug}`).toLowerCase().includes(q));
+  VIEW = RAW.filter(m => (`${m.question} ${m.slug}`.toLowerCase()).includes(q));
   page=0; render();
 }
 function render(){
   tbody.innerHTML="";
   const ps=pageSize();
   const slice=VIEW.slice(page*ps,page*ps+ps);
+
   for(const m of slice){
     const tr=document.createElement('tr');
+
     const tdQ=document.createElement('td');
     const end=parseIso(m.endDateIso);
     const endTxt=end?new Intl.DateTimeFormat(undefined,{year:'numeric',month:'short',day:'numeric'}).format(end):'';
@@ -237,20 +234,122 @@ function render(){
     tdQ.innerHTML=`<div>${escapeHtml(m.question)} ${chip}</div>
                    <div class="muted">${escapeHtml(m.slug||'')} ${endTxt?` · ends ${endTxt}`:''}</div>`;
     tr.appendChild(tdQ);
+
     const tdId=document.createElement('td'); tdId.textContent=m.id; tr.appendChild(tdId);
+
     const tdTok=document.createElement('td');
     if(m.src==="poly"){
-      tdTok.innerHTML=`Best: ${m.bestBid!=null?m.bestBid:'—'} / ${m.bestAsk!=null?m.bestAsk:'—'}`;
+      tdTok.innerHTML = `
+        <div class="muted">Best: ${m.bestBid!=null?Number(m.bestBid).toFixed(2):'—'} / ${m.bestAsk!=null?Number(m.bestAsk).toFixed(2):'—'}</div>
+        <div style="margin-top:6px;">
+          <button data-load-tokens="${m.id}">Load options</button>
+          <button data-view-json="${m.id}">View JSON</button>
+        </div>
+        <div id="tokens-${m.id}" class="muted" style="margin-top:6px;">—</div>
+        <div id="json-${m.id}" class="muted" style="margin-top:6px; display:none;"></div>
+      `;
     } else {
-      tdTok.innerHTML=`Users: ${m.users||'—'} · Liquidity: ${m.liquidity||'—'} · Volume: ${m.volume||'—'}`;
+      const liq = m.liquidity!=null ? Number(m.liquidity).toLocaleString(undefined,{maximumFractionDigits:2}) : '—';
+      const vol = m.volume!=null ? Number(m.volume).toLocaleString(undefined,{maximumFractionDigits:2}) : '—';
+      const vol24 = m.volume24h!=null ? Number(m.volume24h).toLocaleString(undefined,{maximumFractionDigits:2}) : '—';
+      const users = m.users!=null ? Number(m.users).toLocaleString() : '—';
+      tdTok.innerHTML = `
+        <div class="muted">Token: ${escapeHtml(m.tokenSymbol||'—')} · Users: ${users}</div>
+        <div class="muted">Liquidity: ${liq} · 24h Vol: ${vol24} · Total Vol: ${vol}</div>
+        <div style="margin-top:6px;">
+          ${m.resolution_source ? `<a href="${m.resolution_source}" target="_blank" rel="noopener">Resolution source ↗</a>` : ''}
+          <button data-view-json="${m.id}" style="margin-left:8px;">View JSON</button>
+        </div>
+        <div id="json-${m.id}" class="muted" style="margin-top:6px; display:none;"></div>
+      `;
     }
     tr.appendChild(tdTok);
     tbody.appendChild(tr);
   }
-  pageInfo.textContent=`Page ${VIEW.length? page+1:0} of ${Math.ceil(VIEW.length/ps)} — ${VIEW.length} shown`;
+
+  pageInfo.textContent = `Page ${VIEW.length ? page+1 : 0} of ${Math.ceil(VIEW.length/ps)} — ${VIEW.length} shown`;
+
+  tbody.querySelectorAll('button[data-load-tokens]').forEach(btn=>{
+    btn.onclick = () => loadPolyTokens(btn.getAttribute('data-load-tokens'));
+  });
+  tbody.querySelectorAll('button[data-view-json]').forEach(btn=>{
+    btn.onclick = () => toggleJson(btn.getAttribute('data-view-json'));
+  });
 }
 
-// ---------- Start
+// ---------- Polymarket tokens + order book (via Worker)
+async function loadPolyTokens(marketId){
+  const host=document.getElementById(`tokens-${marketId}`);
+  if(!host) return;
+  host.textContent="Loading options…";
+  const meta=BY_ID[String(marketId)]||{};
+  try{
+    let tokens=[], detail=null;
+    try{ detail=await xfetch(`${CLOB}/markets/${marketId}`);}catch(_){}
+    if(detail && Array.isArray(detail.tokens) && detail.tokens.length){
+      tokens=detail.tokens.map(t=>({id:t.id||t.token_id,label:t.name||t.label||t.ticker||t.outcome||'Outcome'}));
+    }else{
+      const ids=typeof meta.clobTokenIds==='string'?JSON.parse(meta.clobTokenIds):(meta.clobTokenIds||[]);
+      const outs=typeof meta.outcomes==='string'?JSON.parse(meta.outcomes):(meta.outcomes||[]);
+      tokens=ids.map((tid,i)=>({id:String(tid),label:String(outs[i]??`Outcome ${i+1}`)}));
+    }
+    if(!tokens.length){ host.textContent="No tokens found for this market."; return; }
+
+    const tbl=document.createElement('table'); tbl.className='mini';
+    tbl.innerHTML=`<thead><tr><th>Outcome</th><th>Token</th><th>Best bid</th><th>Best ask</th><th></th></tr></thead><tbody></tbody>`;
+    const body=tbl.querySelector('tbody');
+
+    for(const t of tokens){
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td>${escapeHtml(t.label)}</td>
+        <td><span class="token">${t.id}</span></td>
+        <td id="bb-${t.id}" class="muted">…</td>
+        <td id="ba-${t.id}" class="muted">…</td>
+        <td><button data-view-book="${t.id}">View book</button></td>`;
+      body.appendChild(tr);
+
+      xfetch(`${CLOB}/book?token_id=${encodeURIComponent(t.id)}`).then(book=>{
+        document.getElementById(`bb-${t.id}`).textContent = book?.bids?.[0]?.price?.toFixed(4) ?? '—';
+        document.getElementById(`ba-${t.id}`).textContent = book?.asks?.[0]?.price?.toFixed(4) ?? '—';
+      }).catch(_=>{
+        document.getElementById(`bb-${t.id}`).textContent='—';
+        document.getElementById(`ba-${t.id}`).textContent='—';
+      });
+    }
+    host.innerHTML=""; host.appendChild(tbl);
+    host.querySelectorAll('button[data-view-book]').forEach(btn=>{
+      btn.onclick=()=>viewBook(btn.getAttribute('data-view-book'),host);
+    });
+  }catch(e){ console.error(e); host.textContent="Failed to load options for this market."; }
+}
+
+async function viewBook(tokenId, host){
+  let existing=document.getElementById(`bookwrap-${tokenId}`);
+  if(existing){ existing.open=!existing.open; return; }
+  const det=document.createElement('details'); det.id=`bookwrap-${tokenId}`; det.open=true;
+  det.innerHTML=`<summary>Order book for ${tokenId}</summary><div id="book-${tokenId}" class="ladder">Loading…</div>`;
+  host.appendChild(det);
+  try{
+    const book=await xfetch(`${CLOB}/book?token_id=${encodeURIComponent(tokenId)}`);
+    const bids=(book?.bids||[]).slice(0,15).map(b=>`${Number(b.price).toFixed(4)} @ ${Number(b.size).toFixed(4)}`).join('<br/>')||'—';
+    const asks=(book?.asks||[]).slice(0,15).map(a=>`${Number(a.price).toFixed(4)} @ ${Number(a.size).toFixed(4)}`).join('<br/>')||'—';
+    document.getElementById(`book-${tokenId}`).innerHTML = `<div><b>Bids (top 15)</b><br/>${bids}</div><div><b>Asks (top 15)</b><br/>${asks}</div>`;
+  }catch(e){ console.error(e); document.getElementById(`book-${tokenId}`).textContent="Failed to load book."; }
+}
+
+// ---------- JSON peek (both sources)
+function toggleJson(id){
+  const el=document.getElementById(`json-${id}`); if(!el) return;
+  if(el.style.display==="none"){
+    const m=BY_ID[String(id)];
+    el.textContent = JSON.stringify(m.src==="poly"?m:m.raw, null, 2);
+    el.style.display="block";
+  }else{
+    el.style.display="none";
+  }
+}
+
+// ---------- Start message (no auto-fetch)
 setStatus("Select a source, then press Refresh to load.");
 </script>
 </body>
