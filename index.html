@@ -51,7 +51,7 @@
   </div>
 
 <script>
-const GAMMA = "https://gamma-api.polymarket.com";
+//const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB  = "https://clob.polymarket.com";
 
 let ALL = [];         // full markets list
@@ -191,7 +191,33 @@ function setStatus(s){ statusEl.textContent = s; }
 function escapeHtml(s){ return (s||"").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 // load immediately
-loadMarkets();
+async function loadMarkets(){
+  setStatus("Loading markets (CLOB) …");
+  try {
+    // pull a lot; adjust 'limit' if you want fewer
+    const resp = await fetch(`${CLOB}/markets?limit=1000&offset=0`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json(); // { markets: [...] } on CLOB
+    // normalize fields we use
+    const list = (data.markets || data || []).map(m => ({
+      id: m.id || m.market_id || m.slug,        // id field varies; keep something unique
+      question: m.question || m.title || m.slug || "(no question)",
+      slug: m.slug || "",
+      active: m.active ?? true,
+      endDateIso: m.endDateIso || m.end_date || "",
+      clobTokenIds: Array.isArray(m.clobTokenIds) ? m.clobTokenIds :
+                    (Array.isArray(m.tokens) ? m.tokens.map(t => t.id || t.token_id) : []),
+      marketType: m.marketType || m.type || "",
+    }));
+    ALL = list;
+    setStatus(`Loaded ${ALL.length} markets.`);
+    applyFilter();
+  } catch (e) {
+    console.error("CLOB /markets error:", e);
+    setStatus("Failed to load markets (CLOB). See console for details.");
+  }
+}
+
 </script>
 </body>
 </html>
