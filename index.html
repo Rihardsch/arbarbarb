@@ -49,23 +49,31 @@ const PROXY = "https://arbarbarb.rihardschnr2.workers.dev"; // your Cloudflare W
 const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB  = "https://clob.polymarket.com";
 
-// proxy fetch helper (cache-bust each request)
-async function xfetch(url){
+// proxy fetch helper with cache-bust + simple backoff on 429
+async function xfetch(url, {retries=4, backoff=500} = {}){
   const bust = `_=${Date.now()}`;
   const sep = url.includes("?") ? "&" : "?";
-  const r = await fetch(`${PROXY}?url=${encodeURIComponent(url + sep + bust)}`);
-  if (!r.ok) throw new Error(`Proxy HTTP ${r.status}`);
-  return r.json();
+  const proxied = `${PROXY}?url=${encodeURIComponent(url + sep + bust)}`;
+  for (let attempt=0; attempt<retries; attempt++){
+    const r = await fetch(proxied);
+    if (r.status === 429){
+      await new Promise(res => setTimeout(res, backoff * (2**attempt)));
+      continue;
+    }
+    if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+    return r.json();
+  }
+  throw new Error(`Retry limit reached for ${url}`);
 }
 
-let RAW=[], VIEW=[], BY_ID={}, page=0;
+let RAW=[], VIEW=[], BY_ID={}, BY_COND={}, page=0;
 const qEl=document.getElementById('q');
 const pageSizeEl=document.getElementById('pageSize');
 const statusEl=document.getElementById('status');
 const tbody=document.getElementById('tbody');
 const pageInfo=document.getElementById('pageInfo');
 
-document.getElementById('refreshBtn').onclick = loadMarkets;
+document.getElementById('refreshBtn').onclick = loadAll;
 document.getElementById('prevBtn').onclick = () => { if (page>0){ page--; render(); } };
 document.getElementById('nextBtn').onclick = () => { if ((page+1)*pageSize() < VIEW.length){ page++; render(); } };
 qEl.oninput = applyFilter;
@@ -76,34 +84,85 @@ function parseIso(s){ const d = s ? new Date(s) : null; return isFinite(d) ? d :
 function escapeHtml(s){ return (s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function setStatus(s){ statusEl.textContent=s; }
 
-// PAGINATED fetch of all open markets
-async function loadMarkets(){
+// 1) CLOB cursor pagination (active/closed handled by Gamma merge)
+async function fetchAllClobMarkets(){
+  let cursor = "";
+  const out = [];
+  while (true){
+    const url = `${CLOB}/markets${cursor ? `?next_cursor=${encodeURIComponent(cursor)}` : ""}`;
+    const data = await xfetch(url);
+    const arr = data?.data || [];
+    out.push(...arr);
+    cursor = data?.next_cursor;
+    setStatus(`CLOB: ${out.length} markets loaded…`);
+    if (!cursor || cursor === "LTE=") break;
+    await new Promise(r => setTimeout(r, 200));
+  }
+  return out;
+}
+
+// 2) Gamma offset pagination (only open markets)
+async function fetchAllGammaOpen(){
+  const limit = 1000;
+  let offset = 0;
+  const out = [];
+  while (true){
+    const url = `${GAMMA}/markets?closed=false&limit=${limit}&offset=${offset}`;
+    const chunk = await xfetch(url);
+    if (!Array.isArray(chunk) || chunk.length === 0) break;
+    out.push(...chunk);
+    offset += chunk.length;
+    setStatus(`Gamma: ${out.length} open markets loaded…`);
+    if (chunk.length < limit) break;
+    await new Promise(r => setTimeout(r, 50));
+  }
+  return out;
+}
+
+// 3) Load both, join on conditionId, and render
+async function loadAll(){
   setStatus("Loading markets…");
   try {
-    const limit = 1000; // big page size
-    let offset = 0;
-    RAW = [];
-    while (true){
-      const url = `${GAMMA}/markets?closed=false&limit=${limit}&offset=${offset}`;
-      const chunk = await xfetch(url);
-      if (!Array.isArray(chunk) || chunk.length === 0) break;
-      RAW.push(...chunk);
-      offset += chunk.length;
-      setStatus(`Loaded ${RAW.length} markets…`);
-      if (chunk.length < limit) break; // last page
-      // small yield to keep UI responsive (optional)
-      await new Promise(r => setTimeout(r, 0));
+    const [clob, gamma] = await Promise.all([fetchAllClobMarkets(), fetchAllGammaOpen()]);
+    // index CLOB by conditionId (and by id if present)
+    const byCond = new Map();
+    for (const m of clob){
+      const key = m.conditionId || m.condition_id || m.condition_id_hex || m.condition_hash;
+      if (!key) continue;
+      byCond.set(String(key).toLowerCase(), m);
     }
 
-    // sort by soonest end date
+    // merge: take Gamma open markets (the UI catalog), enrich from CLOB if available
+    RAW = gamma.map(g => {
+      const condKey = String(g.conditionId || g.questionID).toLowerCase();
+      const cm = byCond.get(condKey) || {};
+      return {
+        // from Gamma
+        id: g.id, question: g.question, slug: g.slug,
+        endDateIso: g.endDateIso || g.endDate,
+        startDateIso: g.startDateIso || g.startDate,
+        active: g.active, closed: g.closed,
+        outcomes: g.outcomes,
+        clobTokenIds: g.clobTokenIds,
+        // helpful extras
+        bestBid: g.bestBid, bestAsk: g.bestAsk,
+        // from CLOB (if present)
+        clob: cm, // keep raw clob record for debugging if needed
+      };
+    });
+
+    // keep handy maps
+    BY_ID = Object.fromEntries(RAW.map(m => [String(m.id), m]));
+    BY_COND = Object.fromEntries(RAW.map(m => [String((m.clob?.conditionId || m.clob?.condition_id || m.clob?.condition_hash || "")).toLowerCase(), m]));
+
+    // sort by soonest end
     RAW.sort((a,b) => {
-      const ea = parseIso(a.endDateIso || a.endDate)?.getTime() ?? Infinity;
-      const eb = parseIso(b.endDateIso || b.endDate)?.getTime() ?? Infinity;
+      const ea = parseIso(a.endDateIso)?.getTime() ?? Infinity;
+      const eb = parseIso(b.endDateIso)?.getTime() ?? Infinity;
       return ea - eb;
     });
 
-    BY_ID = Object.fromEntries(RAW.map(m => [String(m.id), m]));
-    setStatus(`Loaded ${RAW.length} markets total.`);
+    setStatus(`Loaded ${RAW.length} open markets (Gamma) and merged with CLOB.`);
     applyFilter();
   } catch (e) {
     console.error(e);
@@ -126,7 +185,7 @@ function render(){
     const tr=document.createElement('tr');
 
     const tdQ=document.createElement('td');
-    const end = parseIso(m.endDateIso || m.endDate);
+    const end = parseIso(m.endDateIso);
     const endTxt = end ? new Intl.DateTimeFormat(undefined,{year:'numeric',month:'short',day:'numeric'}).format(end) : '';
     tdQ.innerHTML = `<div>${escapeHtml(m.question)} <span class="chip">open</span></div>
                      <div class="muted">${escapeHtml(m.slug||'')} ${endTxt?` · ends ${endTxt}`:''}</div>`;
@@ -152,26 +211,28 @@ function render(){
   });
 }
 
-// Tokens (CLOB first; fall back to Gamma clobTokenIds/outcomes)
+// Build tokens via CLOB detail; fallback to Gamma clobTokenIds+outcomes if needed
 async function loadTokens(marketId){
   const host = document.getElementById(`tokens-${marketId}`);
   if (!host) return;
   host.textContent = "Loading options…";
-  const m = BY_ID[String(marketId)] || {};
 
   try {
+    let tokens = [];
+    // Try CLOB /markets/{id}
     let detail = null;
     try { detail = await xfetch(`${CLOB}/markets/${marketId}`); } catch(_){}
 
-    let tokens = [];
     if (detail && Array.isArray(detail.tokens) && detail.tokens.length){
       tokens = detail.tokens.map(t => ({
         id: t.id || t.token_id,
         label: t.name || t.label || t.ticker || t.outcome || 'Outcome',
       }));
     } else {
-      const tokenIds = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : (m.clobTokenIds || []);
-      const outs     = typeof m.outcomes     === 'string' ? JSON.parse(m.outcomes)     : (m.outcomes || []);
+      // Fallback to Gamma metadata we merged earlier
+      const meta = BY_ID[String(marketId)] || {};
+      const tokenIds = typeof meta.clobTokenIds === 'string' ? JSON.parse(meta.clobTokenIds) : (meta.clobTokenIds || []);
+      const outs     = typeof meta.outcomes     === 'string' ? JSON.parse(meta.outcomes)     : (meta.outcomes || []);
       tokens = tokenIds.map((tid, i) => ({ id: String(tid), label: String(outs[i] ?? `Outcome ${i+1}`) }));
     }
 
@@ -240,7 +301,7 @@ async function viewBook(tokenId, host){
   }
 }
 
-loadMarkets();
+loadAll();
 </script>
 </body>
 </html>
