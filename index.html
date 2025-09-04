@@ -44,261 +44,197 @@
 </div>
 
 <script>
-// --- config ---
-const PROXY = "https://arbarbarb.rihardschnr2.workers.dev"; // your Cloudflare Worker
+const PROXY = "https://arbarbarb.rihardschnr2.workers.dev"; 
 const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB  = "https://clob.polymarket.com";
 
-// proxy fetch helper with cache-bust + simple backoff on 429
-async function xfetch(url, {retries=4, backoff=500} = {}){
-  const bust = `_=${Date.now()}`;
-  const sep = url.includes("?") ? "&" : "?";
-  const proxied = `${PROXY}?url=${encodeURIComponent(url + sep + bust)}`;
-  for (let attempt=0; attempt<retries; attempt++){
-    const r = await fetch(proxied);
-    if (r.status === 429){
-      await new Promise(res => setTimeout(res, backoff * (2**attempt)));
-      continue;
-    }
-    if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+async function xfetch(url,{retries=4,backoff=500}={}){
+  const bust=`_=${Date.now()}`;
+  const sep=url.includes("?")?"&":"?";
+  const proxied=`${PROXY}?url=${encodeURIComponent(url+sep+bust)}`;
+  for(let attempt=0;attempt<retries;attempt++){
+    const r=await fetch(proxied);
+    if(r.status===429){await new Promise(res=>setTimeout(res,backoff*(2**attempt)));continue;}
+    if(!r.ok)throw new Error(`HTTP ${r.status} for ${url}`);
     return r.json();
   }
   throw new Error(`Retry limit reached for ${url}`);
 }
 
-let RAW=[], VIEW=[], BY_ID={}, BY_COND={}, page=0;
+let RAW=[],VIEW=[],BY_ID={},page=0;
 const qEl=document.getElementById('q');
 const pageSizeEl=document.getElementById('pageSize');
 const statusEl=document.getElementById('status');
 const tbody=document.getElementById('tbody');
 const pageInfo=document.getElementById('pageInfo');
 
-document.getElementById('refreshBtn').onclick = loadAll;
-document.getElementById('prevBtn').onclick = () => { if (page>0){ page--; render(); } };
-document.getElementById('nextBtn').onclick = () => { if ((page+1)*pageSize() < VIEW.length){ page++; render(); } };
-qEl.oninput = applyFilter;
-pageSizeEl.onchange = () => { page=0; render(); };
+document.getElementById('refreshBtn').onclick=loadAll;
+document.getElementById('prevBtn').onclick=()=>{if(page>0){page--;render();}};
+document.getElementById('nextBtn').onclick=()=>{if((page+1)*pageSize()<VIEW.length){page++;render();}};
+qEl.oninput=applyFilter;
+pageSizeEl.onchange=()=>{page=0;render();};
 
-function pageSize(){ return parseInt(pageSizeEl.value,10)||100; }
-function parseIso(s){ const d = s ? new Date(s) : null; return isFinite(d) ? d : null; }
-function escapeHtml(s){ return (s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function setStatus(s){ statusEl.textContent=s; }
+function pageSize(){return parseInt(pageSizeEl.value,10)||100;}
+function parseIso(s){const d=s?new Date(s):null;return isFinite(d)?d:null;}
+function escapeHtml(s){return (s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function setStatus(s){statusEl.textContent=s;}
 
-// 1) CLOB cursor pagination (active/closed handled by Gamma merge)
+// CLOB pagination
 async function fetchAllClobMarkets(){
-  let cursor = "";
-  const out = [];
-  while (true){
-    const url = `${CLOB}/markets${cursor ? `?next_cursor=${encodeURIComponent(cursor)}` : ""}`;
-    const data = await xfetch(url);
-    const arr = data?.data || [];
+  let cursor="";const out=[];
+  while(true){
+    const url=`${CLOB}/markets${cursor?`?next_cursor=${encodeURIComponent(cursor)}`:""}`;
+    const data=await xfetch(url);
+    const arr=data?.data||[];
     out.push(...arr);
-    cursor = data?.next_cursor;
+    cursor=data?.next_cursor;
     setStatus(`CLOB: ${out.length} markets loaded…`);
-    if (!cursor || cursor === "LTE=") break;
-    await new Promise(r => setTimeout(r, 200));
+    if(!cursor||cursor==="LTE=")break;
+    await new Promise(r=>setTimeout(r,200));
   }
   return out;
 }
 
-// 2) Gamma offset pagination (only open markets)
+// Gamma pagination
 async function fetchAllGammaOpen(){
-  const limit = 1000;
-  let offset = 0;
-  const out = [];
-  while (true){
-    const url = `${GAMMA}/markets?closed=false&limit=${limit}&offset=${offset}`;
-    const chunk = await xfetch(url);
-    if (!Array.isArray(chunk) || chunk.length === 0) break;
+  const limit=1000;let offset=0;const out=[];
+  while(true){
+    const url=`${GAMMA}/markets?closed=false&limit=${limit}&offset=${offset}`;
+    const chunk=await xfetch(url);
+    if(!Array.isArray(chunk)||chunk.length===0)break;
     out.push(...chunk);
-    offset += chunk.length;
+    offset+=chunk.length;
     setStatus(`Gamma: ${out.length} open markets loaded…`);
-    if (chunk.length < limit) break;
-    await new Promise(r => setTimeout(r, 50));
+    if(chunk.length<limit)break;
+    await new Promise(r=>setTimeout(r,50));
   }
   return out;
 }
 
-// 3) Load both, join on conditionId, and render
+// Load + filter endDate
 async function loadAll(){
   setStatus("Loading markets…");
-  try {
-    const [clob, gamma] = await Promise.all([fetchAllClobMarkets(), fetchAllGammaOpen()]);
-    // index CLOB by conditionId (and by id if present)
-    const byCond = new Map();
-    for (const m of clob){
-      const key = m.conditionId || m.condition_id || m.condition_id_hex || m.condition_hash;
-      if (!key) continue;
-      byCond.set(String(key).toLowerCase(), m);
+  try{
+    const [clob,gamma]=await Promise.all([fetchAllClobMarkets(),fetchAllGammaOpen()]);
+    const byCond=new Map();
+    for(const m of clob){
+      const key=(m.conditionId||m.condition_id||m.condition_hash||"").toLowerCase();
+      if(key)byCond.set(key,m);
     }
-
-    // merge: take Gamma open markets (the UI catalog), enrich from CLOB if available
-    RAW = gamma.map(g => {
-      const condKey = String(g.conditionId || g.questionID).toLowerCase();
-      const cm = byCond.get(condKey) || {};
-      return {
-        // from Gamma
-        id: g.id, question: g.question, slug: g.slug,
-        endDateIso: g.endDateIso || g.endDate,
-        startDateIso: g.startDateIso || g.startDate,
-        active: g.active, closed: g.closed,
-        outcomes: g.outcomes,
-        clobTokenIds: g.clobTokenIds,
-        // helpful extras
-        bestBid: g.bestBid, bestAsk: g.bestAsk,
-        // from CLOB (if present)
-        clob: cm, // keep raw clob record for debugging if needed
+    const now=new Date();
+    RAW=gamma.filter(g=>{
+      const end=parseIso(g.endDateIso||g.endDate);
+      return !end||end>=now; // keep only future or undated
+    }).map(g=>{
+      const condKey=String(g.conditionId||g.questionID||"").toLowerCase();
+      const cm=byCond.get(condKey)||{};
+      return{
+        id:g.id,question:g.question,slug:g.slug,
+        endDateIso:g.endDateIso||g.endDate,
+        active:g.active,closed:g.closed,
+        outcomes:g.outcomes,clobTokenIds:g.clobTokenIds,
+        bestBid:g.bestBid,bestAsk:g.bestAsk,
+        clob:cm
       };
     });
-
-    // keep handy maps
-    BY_ID = Object.fromEntries(RAW.map(m => [String(m.id), m]));
-    BY_COND = Object.fromEntries(RAW.map(m => [String((m.clob?.conditionId || m.clob?.condition_id || m.clob?.condition_hash || "")).toLowerCase(), m]));
-
-    // sort by soonest end
-    RAW.sort((a,b) => {
-      const ea = parseIso(a.endDateIso)?.getTime() ?? Infinity;
-      const eb = parseIso(b.endDateIso)?.getTime() ?? Infinity;
-      return ea - eb;
+    RAW.sort((a,b)=>{
+      const ea=parseIso(a.endDateIso)?.getTime()??Infinity;
+      const eb=parseIso(b.endDateIso)?.getTime()??Infinity;
+      return ea-eb;
     });
-
-    setStatus(`Loaded ${RAW.length} open markets (Gamma) and merged with CLOB.`);
+    BY_ID=Object.fromEntries(RAW.map(m=>[String(m.id),m]));
+    setStatus(`Loaded ${RAW.length} open, unexpired markets.`);
     applyFilter();
-  } catch (e) {
-    console.error(e);
-    setStatus("Failed to load markets.");
-  }
+  }catch(e){console.error(e);setStatus("Failed to load markets.");}
 }
 
 function applyFilter(){
   const q=(qEl.value||"").toLowerCase();
-  VIEW = RAW.filter(m => (`${m.question} ${m.slug}`.toLowerCase()).includes(q));
-  page=0; render();
+  VIEW=RAW.filter(m=>(`${m.question} ${m.slug}`.toLowerCase()).includes(q));
+  page=0;render();
 }
 
 function render(){
   tbody.innerHTML="";
   const ps=pageSize();
-  const slice = VIEW.slice(page*ps, page*ps+ps);
-
-  for (const m of slice){
+  const slice=VIEW.slice(page*ps,page*ps+ps);
+  for(const m of slice){
     const tr=document.createElement('tr');
-
     const tdQ=document.createElement('td');
-    const end = parseIso(m.endDateIso);
-    const endTxt = end ? new Intl.DateTimeFormat(undefined,{year:'numeric',month:'short',day:'numeric'}).format(end) : '';
-    tdQ.innerHTML = `<div>${escapeHtml(m.question)} <span class="chip">open</span></div>
-                     <div class="muted">${escapeHtml(m.slug||'')} ${endTxt?` · ends ${endTxt}`:''}</div>`;
+    const end=parseIso(m.endDateIso);
+    const endTxt=end?new Intl.DateTimeFormat(undefined,{year:'numeric',month:'short',day:'numeric'}).format(end):'';
+    tdQ.innerHTML=`<div>${escapeHtml(m.question)} <span class="chip">open</span></div>
+                   <div class="muted">${escapeHtml(m.slug||'')} ${endTxt?` · ends ${endTxt}`:''}</div>`;
     tr.appendChild(tdQ);
-
-    const tdId=document.createElement('td');
-    tdId.textContent=m.id;
-    tr.appendChild(tdId);
-
+    const tdId=document.createElement('td');tdId.textContent=m.id;tr.appendChild(tdId);
     const tdTok=document.createElement('td');
-    tdTok.innerHTML = `
-      <button data-load-tokens="${m.id}">Load options</button>
-      <div id="tokens-${m.id}" class="muted" style="margin-top:6px;">—</div>
-    `;
+    tdTok.innerHTML=`<button data-load-tokens="${m.id}">Load options</button>
+                     <div id="tokens-${m.id}" class="muted" style="margin-top:6px;">—</div>`;
     tr.appendChild(tdTok);
-
     tbody.appendChild(tr);
   }
-
-  pageInfo.textContent = `Page ${VIEW.length ? page+1 : 0} of ${Math.ceil(VIEW.length/ps)} — ${VIEW.length} shown`;
+  pageInfo.textContent=`Page ${VIEW.length?page+1:0} of ${Math.ceil(VIEW.length/ps)} — ${VIEW.length} shown`;
   tbody.querySelectorAll('button[data-load-tokens]').forEach(btn=>{
-    btn.onclick = () => loadTokens(btn.getAttribute('data-load-tokens'));
+    btn.onclick=()=>loadTokens(btn.getAttribute('data-load-tokens'));
   });
 }
 
-// Build tokens via CLOB detail; fallback to Gamma clobTokenIds+outcomes if needed
 async function loadTokens(marketId){
-  const host = document.getElementById(`tokens-${marketId}`);
-  if (!host) return;
-  host.textContent = "Loading options…";
-
-  try {
-    let tokens = [];
-    // Try CLOB /markets/{id}
-    let detail = null;
-    try { detail = await xfetch(`${CLOB}/markets/${marketId}`); } catch(_){}
-
-    if (detail && Array.isArray(detail.tokens) && detail.tokens.length){
-      tokens = detail.tokens.map(t => ({
-        id: t.id || t.token_id,
-        label: t.name || t.label || t.ticker || t.outcome || 'Outcome',
-      }));
-    } else {
-      // Fallback to Gamma metadata we merged earlier
-      const meta = BY_ID[String(marketId)] || {};
-      const tokenIds = typeof meta.clobTokenIds === 'string' ? JSON.parse(meta.clobTokenIds) : (meta.clobTokenIds || []);
-      const outs     = typeof meta.outcomes     === 'string' ? JSON.parse(meta.outcomes)     : (meta.outcomes || []);
-      tokens = tokenIds.map((tid, i) => ({ id: String(tid), label: String(outs[i] ?? `Outcome ${i+1}`) }));
+  const host=document.getElementById(`tokens-${marketId}`);
+  if(!host)return;
+  host.textContent="Loading options…";
+  try{
+    let tokens=[];
+    let detail=null;
+    try{detail=await xfetch(`${CLOB}/markets/${marketId}`);}catch(_){}
+    if(detail&&Array.isArray(detail.tokens)&&detail.tokens.length){
+      tokens=detail.tokens.map(t=>({id:t.id||t.token_id,label:t.name||t.label||t.ticker||t.outcome||'Outcome'}));
+    }else{
+      const meta=BY_ID[String(marketId)]||{};
+      const tokenIds=typeof meta.clobTokenIds==='string'?JSON.parse(meta.clobTokenIds):(meta.clobTokenIds||[]);
+      const outs=typeof meta.outcomes==='string'?JSON.parse(meta.outcomes):(meta.outcomes||[]);
+      tokens=tokenIds.map((tid,i)=>({id:String(tid),label:String(outs[i]??`Outcome ${i+1}`)}));
     }
-
-    if (!tokens.length){ host.textContent = "No tokens found for this market."; return; }
-
-    const tbl = document.createElement('table');
-    tbl.className = 'mini';
-    tbl.innerHTML = `
-      <thead><tr><th>Outcome</th><th>Token</th><th>Best bid</th><th>Best ask</th><th></th></tr></thead>
-      <tbody></tbody>`;
-    const body = tbl.querySelector('tbody');
-
-    for (const t of tokens){
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td>${escapeHtml(t.label)}</td>
+    if(!tokens.length){host.textContent="No tokens found for this market.";return;}
+    const tbl=document.createElement('table');tbl.className='mini';
+    tbl.innerHTML=`<thead><tr><th>Outcome</th><th>Token</th><th>Best bid</th><th>Best ask</th><th></th></tr></thead><tbody></tbody>`;
+    const body=tbl.querySelector('tbody');
+    for(const t of tokens){
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td>${escapeHtml(t.label)}</td>
         <td><span class="token">${t.id}</span></td>
         <td id="bb-${t.id}" class="muted">…</td>
         <td id="ba-${t.id}" class="muted">…</td>
         <td><button data-view-book="${t.id}">View book</button></td>`;
       body.appendChild(tr);
-
-      xfetch(`${CLOB}/book?token_id=${encodeURIComponent(t.id)}`)
-        .then(book => {
-          document.getElementById(`bb-${t.id}`).textContent = book?.bids?.[0]?.price?.toFixed(4) ?? '—';
-          document.getElementById(`ba-${t.id}`).textContent = book?.asks?.[0]?.price?.toFixed(4) ?? '—';
-        })
-        .catch(_ => {
-          document.getElementById(`bb-${t.id}`).textContent = '—';
-          document.getElementById(`ba-${t.id}`).textContent = '—';
-        });
+      xfetch(`${CLOB}/book?token_id=${encodeURIComponent(t.id)}`).then(book=>{
+        document.getElementById(`bb-${t.id}`).textContent=book?.bids?.[0]?.price?.toFixed(4)??'—';
+        document.getElementById(`ba-${t.id}`).textContent=book?.asks?.[0]?.price?.toFixed(4)??'—';
+      }).catch(_=>{
+        document.getElementById(`bb-${t.id}`).textContent='—';
+        document.getElementById(`ba-${t.id}`).textContent='—';
+      });
     }
-
-    host.innerHTML = "";
-    host.appendChild(tbl);
-
+    host.innerHTML="";host.appendChild(tbl);
     host.querySelectorAll('button[data-view-book]').forEach(btn=>{
-      btn.onclick = () => viewBook(btn.getAttribute('data-view-book'), host);
+      btn.onclick=()=>viewBook(btn.getAttribute('data-view-book'),host);
     });
-
-  } catch (e) {
-    console.error(e);
-    host.textContent = "Failed to load options for this market.";
-  }
+  }catch(e){console.error(e);host.textContent="Failed to load options for this market.";}
 }
 
-async function viewBook(tokenId, host){
-  let existing = document.getElementById(`bookwrap-${tokenId}`);
-  if (existing){ existing.open = !existing.open; return; }
-  const det = document.createElement('details');
-  det.id = `bookwrap-${tokenId}`;
-  det.open = true;
-  det.innerHTML = `<summary>Order book for ${tokenId}</summary><div id="book-${tokenId}" class="ladder">Loading…</div>`;
+async function viewBook(tokenId,host){
+  let existing=document.getElementById(`bookwrap-${tokenId}`);
+  if(existing){existing.open=!existing.open;return;}
+  const det=document.createElement('details');det.id=`bookwrap-${tokenId}`;det.open=true;
+  det.innerHTML=`<summary>Order book for ${tokenId}</summary><div id="book-${tokenId}" class="ladder">Loading…</div>`;
   host.appendChild(det);
-
   try{
-    const book = await xfetch(`${CLOB}/book?token_id=${encodeURIComponent(tokenId)}`);
-    const bids = (book?.bids||[]).slice(0,15).map(b=>`${Number(b.price).toFixed(4)} @ ${Number(b.size).toFixed(4)}`).join('<br/>') || '—';
-    const asks = (book?.asks||[]).slice(0,15).map(a=>`${Number(a.price).toFixed(4)} @ ${Number(a.size).toFixed(4)}`).join('<br/>') || '—';
-    document.getElementById(`book-${tokenId}`).innerHTML = `
-      <div><b>Bids (top 15)</b><br/>${bids}</div>
-      <div><b>Asks (top 15)</b><br/>${asks}</div>`;
-  }catch(e){
-    console.error(e);
-    document.getElementById(`book-${tokenId}`).textContent = "Failed to load book.";
-  }
+    const book=await xfetch(`${CLOB}/book?token_id=${encodeURIComponent(tokenId)}`);
+    const bids=(book?.bids||[]).slice(0,15).map(b=>`${Number(b.price).toFixed(4)} @ ${Number(b.size).toFixed(4)}`).join('<br/>')||'—';
+    const asks=(book?.asks||[]).slice(0,15).map(a=>`${Number(a.price).toFixed(4)} @ ${Number(a.size).toFixed(4)}`).join('<br/>')||'—';
+    document.getElementById(`book-${tokenId}`).innerHTML=`<div><b>Bids (top 15)</b><br/>${bids}</div>
+                                                         <div><b>Asks (top 15)</b><br/>${asks}</div>`;
+  }catch(e){console.error(e);document.getElementById(`book-${tokenId}`).textContent="Failed to load book.";}
 }
 
 loadAll();
