@@ -19,9 +19,6 @@
   .mini th,.mini td{ border-bottom:1px dashed #eee; padding:4px 6px; }
   details { margin-top:6px; }
   .nowrap{ white-space:nowrap; }
-  code { background:#f7f7f7; padding:2px 4px; border-radius:4px; }
-  .pill { display:inline-block; padding:2px 6px; border-radius:999px; background:#f3f3ff; font-size:12px; margin-left:6px; }
-  .danger { background:#fee; border:1px solid #f99; }
 </style>
 </head>
 <body>
@@ -38,7 +35,9 @@
   <label>Page size:
     <select id="pageSize"><option>25</option><option>50</option><option selected>100</option><option>200</option></select>
   </label>
-  <button id="refreshBtn">Refresh</button>
+  <button id="refreshBtn" title="Fetch live from APIs">Refresh (live)</button>
+  <button id="loadCachedBtn" title="Load cached snapshot (KV/localStorage)">Load cached</button>
+  <button id="saveSnapBtn" title="Save current list to KV (requires admin token)">Save snapshot</button>
   <span id="status" class="muted"></span>
 </div>
 
@@ -53,88 +52,10 @@
   <button id="nextBtn">Next →</button>
 </div>
 
-<!-- ======================= Catalog (search by name + persist) ======================= -->
-<hr/>
-<div id="catalog">
-  <h3>Catalog <span class="muted">(search by name; persisted locally)</span></h3>
-  <div class="controls">
-    <button id="catSave">Save current lists to browser</button>
-    <button id="catLoad">Load from browser</button>
-    <button id="catExport">Download JSON</button>
-    <span id="catMsg" class="muted"></span>
-  </div>
-  <div class="controls">
-    <label>Find Polymarket:
-      <input id="catFindPoly" list="polyList" placeholder="search question/slug"/>
-      <datalist id="polyList"></datalist>
-    </label>
-    <button id="catUsePoly">Use → Polymarket ID</button>
-
-    <label>Find Myriad:
-      <input id="catFindMyriad" list="myrList" placeholder="search title/slug"/>
-      <datalist id="myrList"></datalist>
-    </label>
-    <button id="catUseMyriad">Use → Myriad ID</button>
-  </div>
-  <div class="muted">Tip: Use the finder after you’ve loaded each source (Polymarket / Myriad) so the catalog has fresh items.</div>
-</div>
-
-<!-- ======================= Pairs Admin ======================= -->
-<hr/>
-<div id="pairs-admin" style="margin-top:16px;">
-  <h3>Pairs Admin <span class="muted">(Polymarket ↔ Myriad)</span></h3>
-  <div class="controls">
-    <label>Worker:
-      <input id="pairBase" value="https://arbarbarb.rihardschnr2.workers.dev" style="width:360px;">
-    </label>
-    <label>Admin token:
-      <input id="pairTok" type="password" placeholder="paste ADMIN_TOKEN" style="width:260px;">
-    </label>
-    <button id="pairUse">Use in this tab</button>
-    <span id="pairAuthMsg" class="muted"></span>
-  </div>
-
-  <div class="controls">
-    <label>Polymarket ID: <input id="pairPoly" placeholder="e.g. 516710" style="width:160px;"></label>
-    <label>Myriad ID: <input id="pairMyriad" placeholder="e.g. 134" style="width:160px;"></label>
-    <label>Direction:
-      <select id="pairDir">
-        <option value="same">same</option>
-        <option value="inverse">inverse</option>
-      </select>
-    </label>
-  </div>
-
-  <div class="controls">
-    <label>Outcome map (JSON):
-      <input id="pairMap" placeholder='[{"poly":"Yes","myriad":"≥ $125K"},{"poly":"No","myriad":"≤ $105K"}]' style="width:560px;">
-    </label>
-    <label>Notes: <input id="pairNotes" style="width:260px;"></label>
-  </div>
-
-  <div class="controls">
-    <button id="pairBuildMap">Build map from choices…</button>
-    <button id="pairCreate">Create</button>
-    <button id="pairUpsert">Upsert</button>
-    <button id="pairDelete" class="danger">Delete</button>
-    <button id="pairRefresh">Refresh list</button>
-    <span id="pairMsg" class="muted"></span>
-  </div>
-
-  <details id="mapBuilder" style="margin:8px 0; display:none;">
-    <summary><b>Outcome Map Builder</b> <span class="muted">(loads choices, lets you pair them)</span></summary>
-    <div id="mapBuilderInner" style="margin-top:8px; padding:8px; background:#fafafa; border:1px solid #eee; border-radius:8px;">Loading…</div>
-  </details>
-
-  <table class="mini" style="width:100%; margin-top:10px;">
-    <thead><tr><th>Polymarket</th><th>Myriad</th><th>Dir</th><th>Map</th><th>Notes</th><th>Updated</th><th></th></tr></thead>
-    <tbody id="pairTable"></tbody>
-  </table>
-</div>
-
 <script>
 // ---------- Config
-const PROXY = "https://arbarbarb.rihardschnr2.workers.dev/"; // your Cloudflare Worker
+const PROXY = "https://arbarbarb.rihardschnr2.workers.dev/"; // your Cloudflare Worker (same as proxy)
+const SNAP_BASE = PROXY.replace(/\/+$/,''); // snapshots served by same Worker
 const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB  = "https://clob.polymarket.com";
 const MYRIAD_BASE   = "https://api-production.polkamarkets.com/markets";
@@ -154,6 +75,41 @@ async function xfetch(url,{retries=4,backoff=500}={}){
   throw new Error(`Retry limit reached for ${url}`);
 }
 
+// ---------- Snapshots (KV + localStorage)
+const LS_KEY = { poly: "SNAP_POLY", myriad: "SNAP_MYRIAD" };
+
+async function loadSnapshot(src){
+  // 1) localStorage
+  const ls = localStorage.getItem(LS_KEY[src]);
+  if (ls) {
+    try {
+      const parsed = JSON.parse(ls);
+      if (parsed && Array.isArray(parsed.rows)) return parsed;
+    } catch {}
+  }
+  // 2) Worker KV
+  const r = await fetch(`${SNAP_BASE}/snapshots/${src}`);
+  if (!r.ok) return null;
+  const data = await r.json();
+  try { localStorage.setItem(LS_KEY[src], JSON.stringify(data)); } catch(e){}
+  return data;
+}
+
+async function saveSnapshot(src, rows, adminToken){
+  const r = await fetch(`${SNAP_BASE}/admin/snapshots/${src}`, {
+    method: "POST",
+    headers: {
+      "Content-Type":"application/json",
+      "Authorization": "Bearer " + (adminToken || "")
+    },
+    body: JSON.stringify({ rows })
+  });
+  if (!r.ok) throw new Error((await r.text())||"snapshot save failed");
+  const data = await r.json();
+  try { localStorage.setItem(LS_KEY[src], JSON.stringify(data)); } catch(e){}
+  return data;
+}
+
 // ---------- State
 let RAW=[], VIEW=[], BY_ID={}, page=0;
 const sourceEl=document.getElementById('source');
@@ -163,17 +119,31 @@ const statusEl=document.getElementById('status');
 const tbody=document.getElementById('tbody');
 const pageInfo=document.getElementById('pageInfo');
 
-// Catalog state (persisted)
-const CKEY = "CATALOG_V1"; // {poly:[], myriad:[]}
-let CATALOG = { poly: [], myriad: [] };
+const refreshBtn = document.getElementById('refreshBtn');
+const loadCachedBtn = document.getElementById('loadCachedBtn');
+const saveSnapBtn = document.getElementById('saveSnapBtn');
 
 // ---------- UI wiring
-document.getElementById('refreshBtn').onclick = load; // ONLY fetch when Refresh is clicked
+refreshBtn.onclick = () => load(true);           // force live
+loadCachedBtn.onclick = () => load(false);       // cached only
 document.getElementById('prevBtn').onclick = () => { if (page>0){ page--; render(); } };
 document.getElementById('nextBtn').onclick = () => { if ((page+1)*pageSize() < VIEW.length){ page++; render(); } };
 qEl.oninput = applyFilter;
 pageSizeEl.onchange = () => { page=0; render(); };
-sourceEl.onchange = () => setStatus(`Source set to ${sourceEl.value === 'poly' ? 'Polymarket' : 'Myriad'} — press Refresh to load.`);
+// When switching sources, show cached snapshot (no live fetch).
+sourceEl.onchange = () => { load(false); };
+
+saveSnapBtn.onclick = async () => {
+  const tok = sessionStorage.getItem('PAIR_TOKEN') || "";
+  if (!tok) { setStatus("No admin token in this tab (use Pairs Admin → Use in this tab)."); return; }
+  try {
+    const src = sourceEl.value;
+    await saveSnapshot(src, RAW, tok);
+    setStatus(`Saved ${RAW.length} ${src==='poly'?'Polymarket':'Myriad'} rows to KV.`);
+  } catch(e) {
+    setStatus(`Snapshot save failed: ${e.message||e}`);
+  }
+};
 
 // ---------- Utils
 function pageSize(){ return parseInt(pageSizeEl.value,10)||100; }
@@ -183,47 +153,6 @@ function setStatus(s){ statusEl.textContent=s; }
 function today(){ const d=new Date(); d.setHours(0,0,0,0); return d; }
 const nf = (x,dp=2)=> (x==null?'—':Number(x).toLocaleString(undefined,{maximumFractionDigits:dp}));
 const pf = (x,dp=6)=> (x==null?'—':Number(x).toFixed(dp));
-
-// ---------- Catalog helpers
-function saveCatalog() {
-  try { localStorage.setItem(CKEY, JSON.stringify(CATALOG)); return true; } catch { return false; }
-}
-function loadCatalog() {
-  try { const j = JSON.parse(localStorage.getItem(CKEY)||"{}"); CATALOG = { poly:j.poly||[], myriad:j.myriad||[] }; } catch { CATALOG={poly:[],myriad:[]}; }
-  refreshDatalists();
-}
-function refreshDatalists(){
-  // Polymarket
-  const pl = document.getElementById('polyList');
-  pl.innerHTML = "";
-  CATALOG.poly.forEach(m=>{
-    const opt = document.createElement('option');
-    opt.value = `${m.id}|${m.question}`;
-    opt.label = `${m.id} — ${m.question}  (${m.slug||''})`;
-    pl.appendChild(opt);
-  });
-  // Myriad
-  const ml = document.getElementById('myrList');
-  ml.innerHTML = "";
-  CATALOG.myriad.forEach(m=>{
-    const opt = document.createElement('option');
-    opt.value = `${m.id}|${m.title}`;
-    opt.label = `${m.id} — ${m.title}  (${m.slug||''})`;
-    ml.appendChild(opt);
-  });
-}
-function updateCatalogFromRaw(source) {
-  if (source === 'poly') {
-    const add = RAW.map(m => ({ id:String(m.id), question:m.question, slug:m.slug||"" }));
-    const seen = new Set(CATALOG.poly.map(x=>x.id));
-    add.forEach(x=>{ if(!seen.has(x.id)) CATALOG.poly.push(x); });
-  } else {
-    const add = RAW.map(m => ({ id:String(m.id), title:m.question, slug:m.slug||"" }));
-    const seen = new Set(CATALOG.myriad.map(x=>x.id));
-    add.forEach(x=>{ if(!seen.has(x.id)) CATALOG.myriad.push(x); });
-  }
-  refreshDatalists();
-}
 
 // ---------- Polymarket loaders
 async function fetchAllClobMarkets(){
@@ -284,11 +213,14 @@ async function loadPolymarket(){
     });
   BY_ID = Object.fromEntries(RAW.map(m=>[String(m.id), m]));
   setStatus(`Polymarket: ${RAW.length} open, unexpired markets.`);
-  updateCatalogFromRaw('poly'); // << add to catalog
   applyFilter();
+
+  // auto-save snapshot if admin token present (optional)
+  const tok = sessionStorage.getItem('PAIR_TOKEN') || "";
+  if (tok) { try { await saveSnapshot("poly", RAW, tok); } catch(e) { console.warn("snapshot save poly failed", e); } }
 }
 
-// ---------- Myriad loader
+// ---------- Myriad loader (robust) — stores outcomes if present
 async function loadMyriad(){
   const now = today();
   const perPage = 100;
@@ -335,15 +267,34 @@ async function loadMyriad(){
 
   BY_ID = Object.fromEntries(RAW.map(m => [String(m.id), m]));
   setStatus(`Myriad: ${RAW.length} open, unexpired markets.`);
-  updateCatalogFromRaw('myriad'); // << add to catalog
   applyFilter();
+
+  const tok = sessionStorage.getItem('PAIR_TOKEN') || "";
+  if (tok) { try { await saveSnapshot("myriad", RAW, tok); } catch(e) { console.warn("snapshot save myriad failed", e); } }
 }
 
-// ---------- Master loader (manual only)
-async function load(){
+// ---------- Master loader
+// forceLive=true → fetch APIs and then save snapshot (if token present)
+// forceLive=false → only load snapshot; if none, just prompt to refresh
+async function load(forceLive){
   setStatus("Loading…");
+  const src = sourceEl.value; // "poly" | "myriad"
+
+  if (!forceLive) {
+    const snap = await loadSnapshot(src);
+    if (snap && Array.isArray(snap.rows) && snap.rows.length) {
+      RAW = snap.rows;
+      BY_ID = Object.fromEntries(RAW.map(m => [String(m.id), m]));
+      setStatus(`${src==='poly'?'Polymarket':'Myriad'}: loaded ${RAW.length} from snapshot (updated ${snap.updatedAt || 'n/a'}).`);
+      applyFilter();
+      return;
+    }
+    setStatus("No snapshot found. Press “Refresh (live)”.");
+    return;
+  }
+
   try{
-    if(sourceEl.value==="poly"){ await loadPolymarket(); }
+    if(src==="poly"){ await loadPolymarket(); }
     else { await loadMyriad(); }
   }catch(e){
     console.error(e);
@@ -481,7 +432,7 @@ async function viewBook(tokenId, host){
   }catch(e){ console.error(e); document.getElementById(`book-${tokenId}`).textContent="Failed to load book."; }
 }
 
-// ---------- Myriad options (robust)
+// ---------- Myriad options (robust: list -> detail -> outcomes endpoint)
 async function loadMyriadOptions(marketId){
   const host = document.getElementById(`mopts-${marketId}`);
   if(!host) return;
@@ -536,7 +487,7 @@ async function loadMyriadOptions(marketId){
   }
 }
 
-// ---------- JSON peek
+// ---------- JSON peek (both sources)
 function toggleJson(id){
   const el=document.getElementById(`json-${id}`); if(!el) return;
   if(el.style.display==="none"){
@@ -548,33 +499,58 @@ function toggleJson(id){
   }
 }
 
-// ---------- Catalog UI wiring
-const catMsg = document.getElementById('catMsg');
-document.getElementById('catSave').onclick = ()=>{
-  const ok = saveCatalog();
-  catMsg.textContent = ok ? "Saved to your browser." : "Save failed.";
-};
-document.getElementById('catLoad').onclick = ()=>{
-  loadCatalog(); catMsg.textContent = `Loaded ${CATALOG.poly.length} poly, ${CATALOG.myriad.length} myriad.`;
-};
-document.getElementById('catExport').onclick = ()=>{
-  const blob = new Blob([JSON.stringify(CATALOG,null,2)], {type:'application/json'});
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob); a.download = 'market-catalog.json'; a.click();
-};
-document.getElementById('catUsePoly').onclick = ()=>{
-  const v = document.getElementById('catFindPoly').value.trim();
-  const id = v.split('|')[0].trim();
-  if(id) document.getElementById('pairPoly').value = id;
-};
-document.getElementById('catUseMyriad').onclick = ()=>{
-  const v = document.getElementById('catFindMyriad').value.trim();
-  const id = v.split('|')[0].trim();
-  if(id) document.getElementById('pairMyriad').value = id;
-};
-loadCatalog(); // prefill lists on load
+// Initial status (no auto live fetch)
+// But we can try to show cached snapshot immediately for the default source:
+load(false);
+</script>
 
-// ---------- Pairs Admin (calls your Worker /pairs …)
+<hr/>
+<div id="pairs-admin" style="margin-top:16px;">
+  <h3>Pairs Admin <span class="muted">(Polymarket ↔ Myriad)</span></h3>
+  <div class="controls">
+    <label>Worker:
+      <input id="pairBase" value="https://arbarbarb.rihardschnr2.workers.dev" style="width:360px;">
+    </label>
+    <label>Admin token:
+      <input id="pairTok" type="password" placeholder="paste ADMIN_TOKEN" style="width:260px;">
+    </label>
+    <button id="pairUse">Use in this tab</button>
+    <span id="pairAuthMsg" class="muted"></span>
+  </div>
+
+  <div class="controls">
+    <label>Polymarket ID: <input id="pairPoly" placeholder="e.g. 516710" style="width:160px;"></label>
+    <label>Myriad ID: <input id="pairMyriad" placeholder="e.g. 134" style="width:160px;"></label>
+    <label>Direction:
+      <select id="pairDir">
+        <option value="same" selected>same</option>
+        <option value="inverse">inverse</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="controls">
+    <label>Outcome map (JSON):
+      <input id="pairMap" placeholder='[{"poly":"Yes","myriad":"≥ $125K"},{"poly":"No","myriad":"≤ $105K"}]' style="width:560px;">
+    </label>
+    <label>Notes: <input id="pairNotes" style="width:260px;"></label>
+  </div>
+
+  <div class="controls">
+    <button id="pairCreate">Create</button>
+    <button id="pairUpsert">Upsert</button>
+    <button id="pairDelete" style="background:#fee;border:1px solid #f99;">Delete</button>
+    <button id="pairRefresh">Refresh list</button>
+    <span id="pairMsg" class="muted"></span>
+  </div>
+
+  <table class="mini" style="width:100%;">
+    <thead><tr><th>Polymarket</th><th>Myriad</th><th>Dir</th><th>Map</th><th>Notes</th><th>Updated</th><th></th></tr></thead>
+    <tbody id="pairTable"></tbody>
+  </table>
+</div>
+
+<script>
 (function(){
   const el = (id)=>document.getElementById(id);
   const sset = (k,v)=>sessionStorage.setItem(k,v);
@@ -586,8 +562,8 @@ loadCatalog(); // prefill lists on load
   const polyEl = el('pairPoly'), myrEl = el('pairMyriad'), dirEl = el('pairDir'), mapEl = el('pairMap'), notesEl = el('pairNotes');
   const createBtn = el('pairCreate'), upsertBtn = el('pairUpsert'), delBtn = el('pairDelete'), refBtn = el('pairRefresh');
   const msgEl = el('pairMsg'), tbl = el('pairTable');
-  const buildBtn = el('pairBuildMap'), mapWrap = el('mapBuilder'), mapInner = el('mapBuilderInner');
 
+  // Pre-fill from session
   baseEl.value = sget('PAIR_BASE') || baseEl.value;
   tokEl.value = sget('PAIR_TOKEN') || "";
 
@@ -680,105 +656,20 @@ loadCatalog(); // prefill lists on load
     }catch(e){ err(msgEl, e.message); }
   }
 
-  // -------- Outcome Map Builder UI --------
-  async function buildMapUI(){
-    const polyId = polyEl.value.trim(), myrId = myrEl.value.trim();
-    if(!polyId || !myrId){ err(msgEl,'Set Polymarket ID and Myriad ID first'); return; }
-
-    mapWrap.style.display = 'block';
-    mapWrap.open = true;
-    mapInner.textContent = 'Loading choices…';
-
-    // get poly outcomes
-    let polyOut = [];
-    try {
-      const meta = BY_ID[String(polyId)];
-      if (meta && meta.outcomes) {
-        polyOut = typeof meta.outcomes==='string' ? JSON.parse(meta.outcomes) : meta.outcomes;
-      }
-      if (!polyOut?.length) {
-        const detail = await xfetch(`${CLOB}/markets/${polyId}`);
-        if (Array.isArray(detail?.tokens)) {
-          polyOut = detail.tokens.map(t => t.name || t.label || t.ticker || t.outcome).filter(Boolean);
-        }
-      }
-    } catch(_) {}
-
-    // get myriad outcomes
-    let myrOut = [];
-    try {
-      const detail = await xfetch(`${MYRIAD_BASE}/${myrId}?network_id=274133`);
-      const obj = detail && detail.data ? detail.data : detail;
-      if (Array.isArray(obj?.outcomes)) myrOut = obj.outcomes.map(o=>o.title||o.name);
-      if (!myrOut.length) {
-        const maybe = await xfetch(`${MYRIAD_BASE}/${myrId}/outcomes?network_id=274133`);
-        const arr = Array.isArray(maybe) ? maybe : (Array.isArray(maybe?.data)?maybe.data:[]);
-        myrOut = arr.map(o=>o.title||o.name);
-      }
-    } catch(_) {}
-
-    if(!polyOut.length || !myrOut.length){
-      mapInner.innerHTML = `<span class="muted">Could not load all choices. Poly: ${polyOut.length}, Myriad: ${myrOut.length}</span>`;
-      return;
-    }
-
-    // Build rows: for each poly choice, select matching myriad choice
-    const current = (()=>{ try{ return JSON.parse(mapEl.value||'[]'); }catch{ return []; } })();
-    const mapByPoly = new Map(current.map(x=>[String(x.poly), x.myriad]));
-
-    const wrap = document.createElement('div');
-    wrap.innerHTML = `
-      <div class="muted" style="margin-bottom:6px;">Pick a Myriad choice for each Polymarket choice. The JSON will be written to the Outcome map box.</div>
-      <table class="mini"><thead><tr><th>Polymarket choice</th><th>→</th><th>Myriad choice</th></tr></thead><tbody></tbody></table>
-      <div style="margin-top:8px;"><button id="mbWrite">Write to Outcome map</button> <span class="muted" id="mbMsg"></span></div>
-    `;
-    const body = wrap.querySelector('tbody');
-
-    const selects = [];
-    polyOut.forEach(pLabel=>{
-      const tr = document.createElement('tr');
-      const sel = document.createElement('select');
-      sel.style.minWidth = '220px';
-      sel.innerHTML = `<option value="">— choose —</option>` + myrOut.map(m=>`<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
-      const pre = mapByPoly.get(String(pLabel));
-      if (pre) sel.value = pre;
-      tr.innerHTML = `<td>${escapeHtml(String(pLabel))}</td><td style="width:30px;">→</td><td></td>`;
-      tr.children[2].appendChild(sel);
-      body.appendChild(tr);
-      selects.push({ poly:pLabel, sel });
-    });
-
-    mapInner.innerHTML = "";
-    mapInner.appendChild(wrap);
-
-    wrap.querySelector('#mbWrite').onclick = ()=>{
-      const out = [];
-      selects.forEach(({poly,sel})=>{
-        if (sel.value) out.push({ poly:String(poly), myriad:String(sel.value) });
-      });
-      mapEl.value = JSON.stringify(out, null, 2);
-      wrap.querySelector('#mbMsg').textContent = `Wrote ${out.length} mappings.`;
-    };
-  }
-
   createBtn.onclick = create; upsertBtn.onclick = upsert; delBtn.onclick = del; refBtn.onclick = refresh;
-  buildBtn.onclick = buildMapUI;
   refresh();
 
-  // quick row helper for prefilling IDs
+  // Bonus: row helpers — click table row to prefill IDs for quick pairing
   document.getElementById('tbody').addEventListener('click', (ev)=>{
     const tr = ev.target.closest('tr'); if(!tr) return;
     const idTd = tr.children[1]; const id = idTd?.textContent?.trim();
-    const isPoly = (tr.querySelector('.chip')||{}).textContent?.includes('Polymarket');
-    const isMyri = (tr.querySelector('.chip')||{}).textContent?.includes('Myriad');
+    const chip = tr.querySelector('.chip')?.textContent || '';
     if(!id) return;
-    if(isPoly) polyEl.value = id;
-    if(isMyri) myrEl.value = id;
+    if(chip.includes('Polymarket')) el('pairPoly').value = id;
+    if(chip.includes('Myriad'))    el('pairMyriad').value = id;
   });
 })();
-
-// ---------- Start message (no auto-fetch)
-setStatus("Select a source, then press Refresh to load.");
 </script>
+
 </body>
 </html>
