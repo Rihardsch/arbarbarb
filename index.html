@@ -423,5 +423,174 @@ function toggleJson(id){
 // ---------- Start message (no auto-fetch)
 setStatus("Select a source, then press Refresh to load.");
 </script>
+  <hr/>
+<div id="pairs-admin" style="margin-top:16px;">
+  <h3>Pairs Admin <span class="muted">(Polymarket ↔ Myriad)</span></h3>
+  <div class="controls">
+    <label>Worker:
+      <input id="pairBase" value="https://arbarbarb.rihardschnr2.workers.dev" style="width:360px;">
+    </label>
+    <label>Admin token:
+      <input id="pairTok" type="password" placeholder="paste ADMIN_TOKEN" style="width:260px;">
+    </label>
+    <button id="pairUse">Use in this tab</button>
+    <span id="pairAuthMsg" class="muted"></span>
+  </div>
+
+  <div class="controls">
+    <label>Polymarket ID: <input id="pairPoly" placeholder="e.g. 516710" style="width:160px;"></label>
+    <label>Myriad ID: <input id="pairMyriad" placeholder="e.g. 134" style="width:160px;"></label>
+    <label>Direction:
+      <select id="pairDir">
+        <option value="same">same</option>
+        <option value="inverse">inverse</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="controls">
+    <label>Outcome map (JSON):
+      <input id="pairMap" placeholder='[{"poly":"Yes","myriad":"≥ $125K"},{"poly":"No","myriad":"≤ $105K"}]' style="width:560px;">
+    </label>
+    <label>Notes: <input id="pairNotes" style="width:260px;"></label>
+  </div>
+
+  <div class="controls">
+    <button id="pairCreate">Create</button>
+    <button id="pairUpsert">Upsert</button>
+    <button id="pairDelete" style="background:#fee;border:1px solid #f99;">Delete</button>
+    <button id="pairRefresh">Refresh list</button>
+    <span id="pairMsg" class="muted"></span>
+  </div>
+
+  <table class="mini" style="width:100%;">
+    <thead><tr><th>Polymarket</th><th>Myriad</th><th>Dir</th><th>Map</th><th>Notes</th><th>Updated</th><th></th></tr></thead>
+    <tbody id="pairTable"></tbody>
+  </table>
+</div>
+
+<script>
+(function(){
+  const el = (id)=>document.getElementById(id);
+  const sset = (k,v)=>sessionStorage.setItem(k,v);
+  const sget = (k)=>sessionStorage.getItem(k)||"";
+  const ok = (n,t)=>{ n.textContent=t; n.style.color="#137333"; };
+  const err = (n,t)=>{ n.textContent=t; n.style.color="#B00020"; };
+
+  const baseEl = el('pairBase'), tokEl = el('pairTok'), useBtn = el('pairUse'), authMsg = el('pairAuthMsg');
+  const polyEl = el('pairPoly'), myrEl = el('pairMyriad'), dirEl = el('pairDir'), mapEl = el('pairMap'), notesEl = el('pairNotes');
+  const createBtn = el('pairCreate'), upsertBtn = el('pairUpsert'), delBtn = el('pairDelete'), refBtn = el('pairRefresh');
+  const msgEl = el('pairMsg'), tbl = el('pairTable');
+
+  // Pre-fill from session
+  baseEl.value = sget('PAIR_BASE') || baseEl.value;
+  tokEl.value = sget('PAIR_TOKEN') || "";
+
+  useBtn.onclick = ()=>{ sset('PAIR_BASE', baseEl.value.trim()); sset('PAIR_TOKEN', tokEl.value.trim()); ok(authMsg,"Token set for this tab."); };
+
+  async function call(method, path, body){
+    const url = baseEl.value.replace(/\/+$/,'') + path;
+    const r = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type':'application/json',
+        'Authorization': 'Bearer ' + (sget('PAIR_TOKEN')||''),
+      },
+      body: body ? JSON.stringify(body) : undefined
+    });
+    const ct = r.headers.get('content-type')||'';
+    const data = ct.includes('json') ? await r.json() : await r.text();
+    if(!r.ok) throw new Error((data && data.error) || r.statusText);
+    return data;
+  }
+
+  function parseMap(){
+    const t = mapEl.value.trim();
+    if(!t) return [];
+    try { const j = JSON.parse(t); return Array.isArray(j)?j:[]; } catch(e){ throw new Error('Invalid outcome map JSON'); }
+  }
+
+  async function create(){
+    try{
+      const payload = {
+        polyId: polyEl.value.trim(),
+        myriadId: myrEl.value.trim(),
+        direction: dirEl.value,
+        map: parseMap(),
+        notes: notesEl.value.trim(),
+      };
+      if(!payload.polyId || !payload.myriadId) throw new Error('polyId and myriadId required');
+      await call('POST','/admin/pairs', payload);
+      ok(msgEl,'Created.'); await refresh();
+    }catch(e){ err(msgEl,e.message); }
+  }
+  async function upsert(){
+    try{
+      const polyId = polyEl.value.trim(), myriadId = myrEl.value.trim();
+      if(!polyId || !myriadId) throw new Error('polyId and myriadId required');
+      await call('PUT', `/admin/pairs/${encodeURIComponent(polyId)}/${encodeURIComponent(myriadId)}`, {
+        direction: dirEl.value, map: parseMap(), notes: notesEl.value.trim()
+      });
+      ok(msgEl,'Upserted.'); await refresh();
+    }catch(e){ err(msgEl,e.message); }
+  }
+  async function del(){
+    try{
+      const polyId = polyEl.value.trim(), myriadId = myrEl.value.trim();
+      if(!polyId || !myriadId) throw new Error('polyId and myriadId required');
+      await call('DELETE', `/admin/pairs/${encodeURIComponent(polyId)}/${encodeURIComponent(myriadId)}`);
+      ok(msgEl,'Deleted.'); await refresh();
+    }catch(e){ err(msgEl,e.message); }
+  }
+  async function refresh(){
+    try{
+      msgEl.textContent = 'Loading…';
+      const data = await fetch(baseEl.value.replace(/\/+$/,'') + '/pairs').then(r=>r.json());
+      const pairs = data.pairs || [];
+      tbl.innerHTML = '';
+      for(const p of pairs){
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${p.polyId}</td>
+          <td>${p.myriadId}</td>
+          <td>${p.direction||'same'}</td>
+          <td><code>${JSON.stringify(p.map||[])}</code></td>
+          <td>${p.notes||''}</td>
+          <td class="muted">${p.at||''}</td>
+          <td><button data-edit="${p.polyId}|${p.myriadId}">Edit</button></td>`;
+        tbl.appendChild(tr);
+      }
+      tbl.querySelectorAll('button[data-edit]').forEach(btn=>{
+        btn.onclick = ()=>{
+          const [polyId,myriadId] = btn.getAttribute('data-edit').split('|');
+          const p = (pairs||[]).find(x => String(x.polyId)===polyId && String(x.myriadId)===myriadId);
+          if(!p) return;
+          polyEl.value = p.polyId; myrEl.value = p.myriadId;
+          dirEl.value = p.direction||'same'; mapEl.value = JSON.stringify(p.map||[], null, 2);
+          notesEl.value = p.notes||'';
+          window.scrollTo({top:0,behavior:'smooth'});
+        };
+      });
+      ok(msgEl, `${pairs.length} pairs`);
+    }catch(e){ err(msgEl, e.message); }
+  }
+
+  createBtn.onclick = create; upsertBtn.onclick = upsert; delBtn.onclick = del; refBtn.onclick = refresh;
+  refresh();
+
+  // Bonus: row helpers — click “Polymarket” or “Myriad” row to prefill IDs
+  // (Hook into your existing table)
+  document.getElementById('tbody').addEventListener('click', (ev)=>{
+    const tr = ev.target.closest('tr'); if(!tr) return;
+    const idTd = tr.children[1]; const id = idTd?.textContent?.trim();
+    const isPoly = (tr.querySelector('.chip')||{}).textContent?.includes('Polymarket');
+    const isMyri = (tr.querySelector('.chip')||{}).textContent?.includes('Myriad');
+    if(!id) return;
+    if(isPoly) polyEl.value = id;
+    if(isMyri) myrEl.value = id;
+  });
+})();
+</script>
+
 </body>
 </html>
