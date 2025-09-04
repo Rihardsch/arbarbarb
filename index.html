@@ -95,6 +95,8 @@ function parseIso(s){ const d=s?new Date(s):null; return isFinite(d)?d:null; }
 function escapeHtml(s){ return (s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function setStatus(s){ statusEl.textContent=s; }
 function today(){ const d=new Date(); d.setHours(0,0,0,0); return d; }
+const nf = (x,dp=2)=> (x==null?'—':Number(x).toLocaleString(undefined,{maximumFractionDigits:dp}));
+const pf = (x,dp=2)=> (x==null?'—':Number(x).toFixed(dp));
 
 // ---------- Polymarket loaders (via Worker)
 async function fetchAllClobMarkets(){
@@ -158,8 +160,7 @@ async function loadPolymarket(){
   applyFilter();
 }
 
-// ---------- Myriad loader (via Worker) — same pattern as Polymarket
-// Myriad loader (via Worker) — paginated, robust to array or {data:[]}
+// ---------- Myriad loader (via Worker) — adds outcomes
 async function loadMyriad(){
   const now = today();
   const perPage = 100;
@@ -169,7 +170,7 @@ async function loadMyriad(){
   try {
     while (true) {
       const url = `${MYRIAD_BASE}?${MYRIAD_PARAMS}&page=${pageNum}`;
-      const resp = await xfetch(url); // <-- IMPORTANT: through the Worker
+      const resp = await xfetch(url);
       const chunk = Array.isArray(resp) ? resp : (Array.isArray(resp?.data) ? resp.data : []);
       setStatus(`Myriad: page ${pageNum} → ${chunk.length} markets`);
       if (!chunk.length) break;
@@ -195,6 +196,7 @@ async function loadMyriad(){
       liquidity: m.liquidity, volume: m.volume, volume24h: m.volume_24h,
       users: m.users, tokenSymbol: m?.token?.symbol || "",
       resolution_source: m.resolution_source || "",
+      outcomes: Array.isArray(m.outcomes) ? m.outcomes : [],
       raw: m
     }))
     .sort((a,b)=>{
@@ -207,9 +209,6 @@ async function loadMyriad(){
   setStatus(`Myriad: ${RAW.length} open, unexpired markets.`);
   applyFilter();
 }
-
-
-
 
 // ---------- Master loader (manual only)
 async function load(){
@@ -250,7 +249,7 @@ function render(){
     const tdTok=document.createElement('td');
     if(m.src==="poly"){
       tdTok.innerHTML = `
-        <div class="muted">Best: ${m.bestBid!=null?Number(m.bestBid).toFixed(2):'—'} / ${m.bestAsk!=null?Number(m.bestAsk).toFixed(2):'—'}</div>
+        <div class="muted">Best: ${m.bestBid!=null?pf(m.bestBid):'—'} / ${m.bestAsk!=null?pf(m.bestAsk):'—'}</div>
         <div style="margin-top:6px;">
           <button data-load-tokens="${m.id}">Load options</button>
           <button data-view-json="${m.id}">View JSON</button>
@@ -259,17 +258,19 @@ function render(){
         <div id="json-${m.id}" class="muted" style="margin-top:6px; display:none;"></div>
       `;
     } else {
-      const liq = m.liquidity!=null ? Number(m.liquidity).toLocaleString(undefined,{maximumFractionDigits:2}) : '—';
-      const vol = m.volume!=null ? Number(m.volume).toLocaleString(undefined,{maximumFractionDigits:2}) : '—';
-      const vol24 = m.volume24h!=null ? Number(m.volume24h).toLocaleString(undefined,{maximumFractionDigits:2}) : '—';
+      const liq = nf(m.liquidity);
+      const vol = nf(m.volume);
+      const vol24 = nf(m.volume24h);
       const users = m.users!=null ? Number(m.users).toLocaleString() : '—';
       tdTok.innerHTML = `
         <div class="muted">Token: ${escapeHtml(m.tokenSymbol||'—')} · Users: ${users}</div>
         <div class="muted">Liquidity: ${liq} · 24h Vol: ${vol24} · Total Vol: ${vol}</div>
         <div style="margin-top:6px;">
           ${m.resolution_source ? `<a href="${m.resolution_source}" target="_blank" rel="noopener">Resolution source ↗</a>` : ''}
+          <button data-myriad-options="${m.id}" style="margin-left:8px;">Load options</button>
           <button data-view-json="${m.id}" style="margin-left:8px;">View JSON</button>
         </div>
+        <div id="mopts-${m.id}" class="muted" style="margin-top:6px;">—</div>
         <div id="json-${m.id}" class="muted" style="margin-top:6px; display:none;"></div>
       `;
     }
@@ -279,8 +280,12 @@ function render(){
 
   pageInfo.textContent = `Page ${VIEW.length ? page+1 : 0} of ${Math.ceil(VIEW.length/ps)} — ${VIEW.length} shown`;
 
+  // Wire buttons
   tbody.querySelectorAll('button[data-load-tokens]').forEach(btn=>{
     btn.onclick = () => loadPolyTokens(btn.getAttribute('data-load-tokens'));
+  });
+  tbody.querySelectorAll('button[data-myriad-options]').forEach(btn=>{
+    btn.onclick = () => loadMyriadOptions(btn.getAttribute('data-myriad-options'));
   });
   tbody.querySelectorAll('button[data-view-json]').forEach(btn=>{
     btn.onclick = () => toggleJson(btn.getAttribute('data-view-json'));
@@ -345,6 +350,54 @@ async function viewBook(tokenId, host){
     const asks=(book?.asks||[]).slice(0,15).map(a=>`${Number(a.price).toFixed(4)} @ ${Number(a.size).toFixed(4)}`).join('<br/>')||'—';
     document.getElementById(`book-${tokenId}`).innerHTML = `<div><b>Bids (top 15)</b><br/>${bids}</div><div><b>Asks (top 15)</b><br/>${asks}</div>`;
   }catch(e){ console.error(e); document.getElementById(`book-${tokenId}`).textContent="Failed to load book."; }
+}
+
+// ---------- Myriad options (price + shares + holders)
+async function loadMyriadOptions(marketId){
+  const host = document.getElementById(`mopts-${marketId}`);
+  if(!host) return;
+  host.textContent = "Loading options…";
+
+  try {
+    let m = BY_ID[String(marketId)];
+    let outcomes = Array.isArray(m?.outcomes) ? m.outcomes : [];
+
+    // Fallback: fetch details if the list payload had no outcomes
+    if (!outcomes.length) {
+      const detail = await xfetch(`${MYRIAD_BASE}/${marketId}`);
+      outcomes = Array.isArray(detail?.outcomes) ? detail.outcomes : [];
+    }
+
+    if (!outcomes.length) {
+      host.textContent = "No options found for this market.";
+      return;
+    }
+
+    const tbl = document.createElement('table');
+    tbl.className = 'mini';
+    tbl.innerHTML = `
+      <thead><tr><th>Outcome</th><th>Price</th><th>Shares</th><th>Holders</th></tr></thead>
+      <tbody></tbody>
+    `;
+    const body = tbl.querySelector('tbody');
+
+    for (const o of outcomes) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${escapeHtml(o.title || `Outcome ${o.id}`)}</td>
+        <td>${pf(o.price, 6)}</td>
+        <td>${nf(o.shares, 4)}</td>
+        <td>${o.holders != null ? Number(o.holders).toLocaleString() : '—'}</td>
+      `;
+      body.appendChild(tr);
+    }
+
+    host.innerHTML = "";
+    host.appendChild(tbl);
+  } catch (e) {
+    console.error(e);
+    host.textContent = "Failed to load options for this market.";
+  }
 }
 
 // ---------- JSON peek (both sources)
