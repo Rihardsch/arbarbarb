@@ -49,14 +49,16 @@ const PROXY = "https://arbarbarb.rihardschnr2.workers.dev"; // your Cloudflare W
 const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB  = "https://clob.polymarket.com";
 
-// proxy fetch helper
+// proxy fetch helper (cache-busted to avoid stale responses)
 async function xfetch(url){
-  const r = await fetch(`${PROXY}?url=${encodeURIComponent(url)}`);
+  const bust = `_=${Date.now()}`;
+  const sep = url.includes("?") ? "&" : "?";
+  const r = await fetch(`${PROXY}?url=${encodeURIComponent(url + sep + bust)}`);
   if (!r.ok) throw new Error(`Proxy HTTP ${r.status}`);
   return r.json();
 }
 
-let RAW=[], VIEW=[], page=0;
+let RAW=[], VIEW=[], BY_ID={}, page=0;
 const qEl=document.getElementById('q');
 const pageSizeEl=document.getElementById('pageSize');
 const statusEl=document.getElementById('status');
@@ -71,14 +73,25 @@ pageSizeEl.onchange = () => { page=0; render(); };
 
 function pageSize(){ return parseInt(pageSizeEl.value,10)||100; }
 function parseIso(s){ const d = s ? new Date(s) : null; return isFinite(d) ? d : null; }
+function escapeHtml(s){ return (s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function setStatus(s){ statusEl.textContent=s; }
 
 async function loadMarkets(){
   setStatus("Loading markets…");
   try {
-    const today = new Date().toISOString().slice(0,10); // YYYY-MM-DD
-    const url = `${GAMMA}/markets?closed=false&endDateIso=${today}`;
+    // Your requested filter: only open (closed=false). No recency logic.
+    const url = `${GAMMA}/markets?closed=false`;
     const data = await xfetch(url);
+
     RAW = Array.isArray(data) ? data : [];
+    BY_ID = Object.fromEntries(RAW.map(m => [String(m.id), m])); // keep for token fallback
+    // sort by soonest end date (nice for open markets)
+    RAW.sort((a,b) => {
+      const ea = parseIso(a.endDateIso)?.getTime() ?? Infinity;
+      const eb = parseIso(b.endDateIso)?.getTime() ?? Infinity;
+      return ea - eb;
+    });
+
     setStatus(`Loaded ${RAW.length} markets.`);
     applyFilter();
   } catch (e) {
@@ -89,10 +102,7 @@ async function loadMarkets(){
 
 function applyFilter(){
   const q=(qEl.value||"").toLowerCase();
-  VIEW = RAW.filter(m => {
-    const text = `${m.question} ${m.slug}`.toLowerCase();
-    return text.includes(q);
-  });
+  VIEW = RAW.filter(m => (`${m.question} ${m.slug}`.toLowerCase()).includes(q));
   page=0; render();
 }
 
@@ -100,11 +110,12 @@ function render(){
   tbody.innerHTML="";
   const ps=pageSize();
   const slice = VIEW.slice(page*ps, page*ps+ps);
+
   for (const m of slice){
     const tr=document.createElement('tr');
 
     const tdQ=document.createElement('td');
-    const end = parseIso(m.endDateIso);
+    const end = parseIso(m.endDateIso || m.endDate);
     const endTxt = end ? new Intl.DateTimeFormat(undefined,{year:'numeric',month:'short',day:'numeric'}).format(end) : '';
     tdQ.innerHTML = `<div>${escapeHtml(m.question)} <span class="chip">open</span></div>
                      <div class="muted">${escapeHtml(m.slug||'')} ${endTxt?` · ends ${endTxt}`:''}</div>`;
@@ -123,23 +134,45 @@ function render(){
 
     tbody.appendChild(tr);
   }
+
   pageInfo.textContent = `Page ${VIEW.length ? page+1 : 0} of ${Math.ceil(VIEW.length/ps)} — ${VIEW.length} shown`;
   tbody.querySelectorAll('button[data-load-tokens]').forEach(btn=>{
     btn.onclick = () => loadTokens(btn.getAttribute('data-load-tokens'));
   });
 }
 
-// fetch all tokens/outcomes for a market and show best bid/ask
+// Try CLOB for tokens; if empty/fails, fall back to Gamma's clobTokenIds + outcomes
 async function loadTokens(marketId){
   const host = document.getElementById(`tokens-${marketId}`);
   if (!host) return;
   host.textContent = "Loading options…";
+  const m = BY_ID[String(marketId)] || {};
+
   try {
-    const detail = await xfetch(`${CLOB}/markets/${marketId}`);
-    const tokens = (detail?.tokens || []).map(t => ({
-      id: t.id || t.token_id,
-      label: t.name || t.label || t.ticker || t.outcome || 'Outcome',
-    }));
+    // Primary: ask CLOB for market detail (if available for numeric ids)
+    let detail = null;
+    try {
+      detail = await xfetch(`${CLOB}/markets/${marketId}`);
+    } catch (_e) {
+      // ignore, we'll use fallback
+    }
+
+    let tokens = [];
+    if (detail && Array.isArray(detail.tokens) && detail.tokens.length){
+      tokens = detail.tokens.map(t => ({
+        id: t.id || t.token_id,
+        label: t.name || t.label || t.ticker || t.outcome || 'Outcome',
+      }));
+    } else {
+      // Fallback: build from Gamma data
+      // Gamma gives clobTokenIds and outcomes as JSON-encoded strings in many markets.
+      const tokenIds = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : (m.clobTokenIds || []);
+      const outs     = typeof m.outcomes     === 'string' ? JSON.parse(m.outcomes)     : (m.outcomes || []);
+      tokens = tokenIds.map((tid, i) => ({
+        id: String(tid),
+        label: String(outs[i] ?? `Outcome ${i+1}`),
+      }));
+    }
 
     if (!tokens.length){
       host.textContent = "No tokens found for this market.";
@@ -189,7 +222,6 @@ async function loadTokens(marketId){
   }
 }
 
-// full ladder for a token
 async function viewBook(tokenId, host){
   let existing = document.getElementById(`bookwrap-${tokenId}`);
   if (existing){ existing.open = !existing.open; return; }
@@ -201,8 +233,8 @@ async function viewBook(tokenId, host){
 
   try{
     const book = await xfetch(`${CLOB}/book?token_id=${encodeURIComponent(tokenId)}`);
-    const bids = (book?.bids||[]).slice(0,15).map(b=>`${fmt(b.price)} @ ${fmt(b.size)}`).join('<br/>') || '—';
-    const asks = (book?.asks||[]).slice(0,15).map(a=>`${fmt(a.price)} @ ${fmt(a.size)}`).join('<br/>') || '—';
+    const bids = (book?.bids||[]).slice(0,15).map(b=>`${Number(b.price).toFixed(4)} @ ${Number(b.size).toFixed(4)}`).join('<br/>') || '—';
+    const asks = (book?.asks||[]).slice(0,15).map(a=>`${Number(a.price).toFixed(4)} @ ${Number(a.size).toFixed(4)}`).join('<br/>') || '—';
     document.getElementById(`book-${tokenId}`).innerHTML = `
       <div><b>Bids (top 15)</b><br/>${bids}</div>
       <div><b>Asks (top 15)</b><br/>${asks}</div>`;
@@ -211,10 +243,6 @@ async function viewBook(tokenId, host){
     document.getElementById(`book-${tokenId}`).textContent = "Failed to load book.";
   }
 }
-
-function fmt(x){ return Number(x).toFixed(4); }
-function setStatus(s){ statusEl.textContent=s; }
-function escapeHtml(s){ return (s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 loadMarkets();
 </script>
