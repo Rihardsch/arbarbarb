@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Polymarket Explorer (free)</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 16px; }
+    h1 { margin: 0 0 12px; }
+    .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    input, button, select { padding: 6px 8px; font-size: 14px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #ddd; padding: 8px; text-align: left; vertical-align: top; }
+    .muted { opacity: 0.7; font-size: 12px; }
+    .token { display: inline-block; font-family: ui-monospace, Menlo, monospace; font-size: 12px; background: #f5f5f5; padding: 2px 6px; border-radius: 6px; margin: 2px 4px 2px 0; }
+    details { margin-top: 6px; }
+    .ladder { display: grid; grid-template-columns: 100px 100px; gap: 6px; margin-top: 6px; }
+    .chip { display:inline-block; padding:2px 6px; border-radius:999px; background:#eef; font-size:12px; margin-left:6px; }
+  </style>
+</head>
+<body>
+  <h1>Polymarket Explorer <span class="muted">(markets + order books)</span></h1>
+
+  <div class="controls">
+    <label>Filter: <input id="q" placeholder="type to filter by question/slug" /></label>
+    <label>Only active: <input id="onlyActive" type="checkbox" checked /></label>
+    <label>Page size:
+      <select id="pageSize">
+        <option>25</option><option>50</option><option selected>100</option><option>200</option>
+      </select>
+    </label>
+    <button id="refreshBtn">Refresh</button>
+    <span id="status" class="muted"></span>
+  </div>
+
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>Market ID</th>
+        <th>Tokens</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+  <div class="controls">
+    <button id="prevBtn">← Prev</button>
+    <span id="pageInfo" class="muted"></span>
+    <button id="nextBtn">Next →</button>
+  </div>
+
+<script>
+const GAMMA = "https://gamma-api.polymarket.com";
+const CLOB  = "https://clob.polymarket.com";
+
+let ALL = [];         // full markets list
+let VIEW = [];        // filtered list
+let page = 0;
+
+const qEl = document.getElementById('q');
+const onlyActiveEl = document.getElementById('onlyActive');
+const pageSizeEl = document.getElementById('pageSize');
+const statusEl = document.getElementById('status');
+const tbody = document.getElementById('tbody');
+const pageInfo = document.getElementById('pageInfo');
+
+document.getElementById('refreshBtn').onclick = loadMarkets;
+document.getElementById('prevBtn').onclick = () => { if (page>0){ page--; render(); } };
+document.getElementById('nextBtn').onclick = () => { if ((page+1)*pageSize() < VIEW.length){ page++; render(); } };
+qEl.oninput = applyFilter;
+onlyActiveEl.onchange = applyFilter;
+pageSizeEl.onchange = () => { page = 0; render(); };
+
+function pageSize(){ return parseInt(pageSizeEl.value, 10) || 100; }
+
+async function loadMarkets(){
+  setStatus("Loading markets…");
+  try {
+    const resp = await fetch(`${GAMMA}/markets`);
+    const data = await resp.json();
+    // keep handy fields
+    ALL = data.map(m => ({
+      id: m.id,
+      question: m.question,
+      slug: m.slug,
+      active: !!m.active,
+      endDateIso: m.endDateIso,
+      clobTokenIds: Array.isArray(m.clobTokenIds) ? m.clobTokenIds : [],
+      marketType: m.marketType,
+    }));
+    setStatus(`Loaded ${ALL.length} markets.`);
+    applyFilter();
+  } catch (e) {
+    console.error(e);
+    setStatus("Failed to load markets.");
+  }
+}
+
+function applyFilter(){
+  const q = (qEl.value || "").toLowerCase();
+  const onlyActive = onlyActiveEl.checked;
+  VIEW = ALL.filter(m => {
+    if (onlyActive && !m.active) return false;
+    const text = `${m.question} ${m.slug}`.toLowerCase();
+    return text.includes(q);
+  });
+  page = 0;
+  render();
+}
+
+function render(){
+  tbody.innerHTML = "";
+  const ps = pageSize();
+  const slice = VIEW.slice(page*ps, page*ps + ps);
+
+  for (const m of slice) {
+    const tr = document.createElement('tr');
+
+    const tdQ = document.createElement('td');
+    tdQ.innerHTML = `
+      <div>${escapeHtml(m.question)} ${m.active ? '<span class="chip">active</span>' : ''}</div>
+      <div class="muted">${escapeHtml(m.slug || '')}</div>
+    `;
+    tr.appendChild(tdQ);
+
+    const tdId = document.createElement('td');
+    tdId.textContent = m.id;
+    tr.appendChild(tdId);
+
+    const tdTok = document.createElement('td');
+    if (m.clobTokenIds.length === 0) {
+      tdTok.textContent = "—";
+    } else {
+      const container = document.createElement('div');
+      m.clobTokenIds.forEach(tid => {
+        const wrap = document.createElement('div');
+        wrap.innerHTML = `
+          <span class="token">${tid}</span>
+          <button data-tok="${tid}">Load book</button>
+          <details><summary class="muted">book</summary><div class="book" id="book-${tid}">—</div></details>
+        `;
+        container.appendChild(wrap);
+      });
+      tdTok.appendChild(container);
+    }
+    tr.appendChild(tdTok);
+
+    tbody.appendChild(tr);
+  }
+
+  pageInfo.textContent = `Page ${VIEW.length ? page+1 : 0} of ${Math.ceil(VIEW.length / ps)} — ${VIEW.length} shown${VIEW.length!==ALL.length ? ` (filtered from ${ALL.length})` : ''}`;
+  // attach listeners for “Load book” buttons
+  tbody.querySelectorAll('button[data-tok]').forEach(btn => {
+    btn.onclick = () => loadBook(btn.getAttribute('data-tok'));
+  });
+}
+
+async function loadBook(tokenId){
+  const target = document.getElementById(`book-${tokenId}`);
+  if (!target) return;
+  target.textContent = "Loading…";
+  try {
+    const resp = await fetch(`${CLOB}/book?token_id=${encodeURIComponent(tokenId)}`);
+    const book = await resp.json();
+    target.innerHTML = renderBook(book);
+  } catch (e) {
+    console.error(e);
+    target.textContent = "Failed to load book.";
+  }
+}
+
+function renderBook(book){
+  const bestBid = book?.bids?.[0]?.price ?? null;
+  const bestAsk = book?.asks?.[0]?.price ?? null;
+
+  const bids = (book?.bids || []).slice(0, 10).map(b => `${fmt(b.price)} @ ${fmt(b.size)}`).join('<br/>');
+  const asks = (book?.asks || []).slice(0, 10).map(a => `${fmt(a.price)} @ ${fmt(a.size)}`).join('<br/>');
+
+  return `
+    <div>best bid: <b>${bestBid==null?'-':fmt(bestBid)}</b> &nbsp;|&nbsp; best ask: <b>${bestAsk==null?'-':fmt(bestAsk)}</b></div>
+    <div class="ladder">
+      <div><b>Bids (top 10)</b><br/>${bids || '—'}</div>
+      <div><b>Asks (top 10)</b><br/>${asks || '—'}</div>
+    </div>
+  `;
+}
+
+function fmt(x){ return Number(x).toFixed(4); }
+function setStatus(s){ statusEl.textContent = s; }
+function escapeHtml(s){ return (s||"").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+// load immediately
+loadMarkets();
+</script>
+</body>
+</html>
