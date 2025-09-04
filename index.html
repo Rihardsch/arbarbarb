@@ -55,7 +55,9 @@
 const PROXY = "https://arbarbarb.rihardschnr2.workers.dev";
 const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB  = "https://clob.polymarket.com";
-const MYRIAD_URL = "https://api-production.polkamarkets.com/markets?network_id=274133&state=open&land_ids=myriad-szn2-usdc-v33";
+// Myriad base + fixed params (your link), we'll paginate with &page=
+const MYRIAD_BASE   = "https://api-production.polkamarkets.com/markets";
+const MYRIAD_PARAMS = "network_id=274133&state=open&land_ids=myriad-szn2-usdc-v33&per_page=100";
 
 // ---------- Proxy fetch with cache-bust + gentle 429 backoff
 async function xfetch(url,{retries=4,backoff=500}={}){
@@ -132,10 +134,7 @@ async function loadPolymarket(){
   }
   const now=today();
   RAW = gamma
-    .filter(g => {
-      const end=parseIso(g.endDateIso||g.endDate);
-      return !end || end >= now;
-    })
+    .filter(g => { const end=parseIso(g.endDateIso||g.endDate); return !end || end >= now; })
     .map(g=>{
       const condKey=String(g.conditionId||g.questionID||"").toLowerCase();
       const cm=byCond.get(condKey)||{};
@@ -158,17 +157,34 @@ async function loadPolymarket(){
   setStatus(`Polymarket: ${RAW.length} open, unexpired markets.`);
 }
 
-// ---------- Myriad (Polkamarkets) loader (your link), unexpired filter
+// ---------- Myriad loader with full pagination & unexpired filter (same pattern)
 async function loadMyriad(){
-  const data = await xfetch(MYRIAD_URL);
   const now=today();
-  RAW = (Array.isArray(data)?data:[])
-    .filter(m => m?.state === "open")
-    .filter(m => {
-      const end=parseIso(m.expires_at);
+  const perPage=100;
+  let pageNum=1;
+  const all=[];
+
+  // page through until the API returns fewer than perPage (or zero)
+  while(true){
+    const url = `${MYRIAD_BASE}?${MYRIAD_PARAMS}&page=${pageNum}`;
+    const resp = await xfetch(url);
+    // Endpoint may return an array or { data: [...] }
+    const chunk = Array.isArray(resp) ? resp : (Array.isArray(resp?.data) ? resp.data : []);
+    setStatus(`Myriad: page ${pageNum} → ${chunk.length} markets`);
+    if (!chunk.length) break;
+    all.push(...chunk);
+    if (chunk.length < perPage) break;
+    pageNum++;
+    await new Promise(r=>setTimeout(r,80));
+  }
+
+  RAW = all
+    .filter(m => m?.state === "open")                 // open only
+    .filter(m => {                                    // not expired
+      const end = parseIso(m.expires_at);
       return !end || end >= now;
     })
-    .map(m => ({
+    .map(m => ({                                      // normalized fields
       src:"myriad",
       id:m.id, question:m.title, slug:m.slug,
       endDateIso:m.expires_at,
@@ -183,8 +199,9 @@ async function loadMyriad(){
       const eb=parseIso(b.endDateIso)?.getTime()??Infinity;
       return ea-eb;
     });
+
   BY_ID = Object.fromEntries(RAW.map(m=>[String(m.id), m]));
-  setStatus(`Myriad: ${RAW.length} open, unexpired markets.`);
+  setStatus(`Myriad: ${RAW.length} open, unexpired markets (across ${pageNum} page${pageNum>1?'s':''}).`);
 }
 
 // ---------- Master loader
