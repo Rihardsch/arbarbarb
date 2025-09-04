@@ -55,7 +55,6 @@
 const PROXY = "https://arbarbarb.rihardschnr2.workers.dev";
 const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB  = "https://clob.polymarket.com";
-// Myriad base + fixed params (your link), we'll paginate with &page=
 const MYRIAD_BASE   = "https://api-production.polkamarkets.com/markets";
 const MYRIAD_PARAMS = "network_id=274133&state=open&land_ids=myriad-szn2-usdc-v33&per_page=100";
 
@@ -82,12 +81,16 @@ const tbody=document.getElementById('tbody');
 const pageInfo=document.getElementById('pageInfo');
 
 // ---------- UI wiring
-document.getElementById('refreshBtn').onclick = load;
+document.getElementById('refreshBtn').onclick = load; // ONLY fetch when Refresh is clicked
 document.getElementById('prevBtn').onclick = () => { if (page>0){ page--; render(); } };
 document.getElementById('nextBtn').onclick = () => { if ((page+1)*pageSize() < VIEW.length){ page++; render(); } };
-sourceEl.onchange = load;
 qEl.oninput = applyFilter;
 pageSizeEl.onchange = () => { page=0; render(); };
+
+// Switching source DOES NOT fetch; just update status prompt
+sourceEl.onchange = () => {
+  setStatus(`Source set to ${sourceEl.value === 'poly' ? 'Polymarket' : 'Myriad'} — press Refresh to load.`);
+};
 
 // ---------- Utils
 function pageSize(){ return parseInt(pageSizeEl.value,10)||100; }
@@ -164,11 +167,9 @@ async function loadMyriad(){
   let pageNum=1;
   const all=[];
 
-  // page through until the API returns fewer than perPage (or zero)
   while(true){
     const url = `${MYRIAD_BASE}?${MYRIAD_PARAMS}&page=${pageNum}`;
     const resp = await xfetch(url);
-    // Endpoint may return an array or { data: [...] }
     const chunk = Array.isArray(resp) ? resp : (Array.isArray(resp?.data) ? resp.data : []);
     setStatus(`Myriad: page ${pageNum} → ${chunk.length} markets`);
     if (!chunk.length) break;
@@ -179,12 +180,9 @@ async function loadMyriad(){
   }
 
   RAW = all
-    .filter(m => m?.state === "open")                 // open only
-    .filter(m => {                                    // not expired
-      const end = parseIso(m.expires_at);
-      return !end || end >= now;
-    })
-    .map(m => ({                                      // normalized fields
+    .filter(m => m?.state === "open")
+    .filter(m => { const end=parseIso(m.expires_at); return !end || end >= now; })
+    .map(m => ({
       src:"myriad",
       id:m.id, question:m.title, slug:m.slug,
       endDateIso:m.expires_at,
@@ -201,14 +199,13 @@ async function loadMyriad(){
     });
 
   BY_ID = Object.fromEntries(RAW.map(m=>[String(m.id), m]));
-  setStatus(`Myriad: ${RAW.length} open, unexpired markets (across ${pageNum} page${pageNum>1?'s':''}).`);
+  setStatus(`Myriad: ${RAW.length} open, unexpired markets.`);
 }
 
-// ---------- Master loader
+// ---------- Master loader (only called from Refresh button)
 async function load(){
   setStatus("Loading…");
-  tbody.innerHTML=""; pageInfo.textContent="";
-  RAW=[]; VIEW=[]; BY_ID={}; page=0;
+  // do NOT auto-clear the table; keep whatever is already shown until load completes
   try{
     if(sourceEl.value==="poly"){ await loadPolymarket(); } else { await loadMyriad(); }
     applyFilter();
@@ -352,8 +349,8 @@ function toggleJson(id){
   }
 }
 
-// ---------- Start
-load();
+// ---------- Start message (no auto-fetch)
+setStatus("Select a source, then press Refresh to load.");
 </script>
 </body>
 </html>
