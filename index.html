@@ -159,47 +159,57 @@ async function loadPolymarket(){
 }
 
 // ---------- Myriad loader (via Worker) — same pattern as Polymarket
+// Myriad loader (via Worker) — paginated, robust to array or {data:[]}
 async function loadMyriad(){
-  const now=today();
-  const perPage=100;
-  let pageNum=1;
-  const all=[];
+  const now = today();
+  const perPage = 100;
+  let pageNum = 1;
+  const all = [];
 
-  while(true){
-    const url = `${MYRIAD_BASE}?${MYRIAD_PARAMS}&page=${pageNum}`;
-    const resp = await xfetch(url);
-    const chunk = Array.isArray(resp) ? resp : (Array.isArray(resp?.data) ? resp.data : []);
-    setStatus(`Myriad: page ${pageNum} → ${chunk.length} markets`);
-    if (!chunk.length) break;
-    all.push(...chunk);
-    if (chunk.length < perPage) break;
-    pageNum++;
-    await new Promise(r=>setTimeout(r,80));
+  try {
+    while (true) {
+      const url = `${MYRIAD_BASE}?${MYRIAD_PARAMS}&page=${pageNum}`;
+      const resp = await xfetch(url); // <-- IMPORTANT: through the Worker
+      const chunk = Array.isArray(resp) ? resp : (Array.isArray(resp?.data) ? resp.data : []);
+      setStatus(`Myriad: page ${pageNum} → ${chunk.length} markets`);
+      if (!chunk.length) break;
+      all.push(...chunk);
+      if (chunk.length < perPage) break;
+      pageNum++;
+      await new Promise(r => setTimeout(r, 80));
+    }
+  } catch (e) {
+    console.error("Myriad fetch via Worker failed:", e);
+    setStatus(`Myriad fetch via Worker failed: ${e?.message || e}`);
+    return;
   }
 
   RAW = all
     .filter(m => m?.state === "open")
-    .filter(m => { const end=parseIso(m.expires_at); return !end || end >= now; })
+    .filter(m => { const end = parseIso(m.expires_at); return !end || end >= now; })
     .map(m => ({
-      src:"myriad",
-      id:m.id, question:m.title, slug:m.slug,
-      endDateIso:m.expires_at,
-      active:true, closed:false,
-      liquidity:m.liquidity, volume:m.volume, volume24h:m.volume_24h,
-      users:m.users, tokenSymbol:m?.token?.symbol || "",
-      resolution_source:m.resolution_source || "",
-      raw:m
+      src: "myriad",
+      id: m.id, question: m.title, slug: m.slug,
+      endDateIso: m.expires_at,
+      active: true, closed: false,
+      liquidity: m.liquidity, volume: m.volume, volume24h: m.volume_24h,
+      users: m.users, tokenSymbol: m?.token?.symbol || "",
+      resolution_source: m.resolution_source || "",
+      raw: m
     }))
     .sort((a,b)=>{
-      const ea=parseIso(a.endDateIso)?.getTime()??Infinity;
-      const eb=parseIso(b.endDateIso)?.getTime()??Infinity;
-      return ea-eb;
+      const ea = parseIso(a.endDateIso)?.getTime() ?? Infinity;
+      const eb = parseIso(b.endDateIso)?.getTime() ?? Infinity;
+      return ea - eb;
     });
 
-  BY_ID = Object.fromEntries(RAW.map(m=>[String(m.id), m]));
+  BY_ID = Object.fromEntries(RAW.map(m => [String(m.id), m]));
   setStatus(`Myriad: ${RAW.length} open, unexpired markets.`);
   applyFilter();
 }
+
+
+
 
 // ---------- Master loader (manual only)
 async function load(){
