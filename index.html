@@ -1,48 +1,48 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Market Explorer (Polymarket & Myriad)</title>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Market Explorer (DB-backed)</title>
 <style>
-  body { font-family: system-ui, Arial, sans-serif; margin: 16px; }
-  h1 { margin: 0 0 12px; }
-  .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
-  input,button,select { padding:6px 8px; font-size:14px; }
-  table { width:100%; border-collapse: collapse; }
-  th,td { border-bottom:1px solid #ddd; padding:8px; text-align:left; vertical-align:top; }
-  .muted{ opacity:.7; font-size:12px; }
-  .token{ display:inline-block; font-family:ui-monospace,Menlo,monospace; font-size:12px; background:#f5f5f5; padding:2px 6px; border-radius:6px; margin:2px 4px 2px 0; }
-  .chip{ display:inline-block; padding:2px 6px; border-radius:999px; background:#e8f8e8; font-size:12px; margin-left:6px; }
-  .ladder{ display:grid; grid-template-columns:120px 120px; gap:10px; margin-top:6px; }
-  .mini { font-size:12px; width:100%; border-collapse: collapse; margin-top:4px; }
-  .mini th,.mini td{ border-bottom:1px dashed #eee; padding:4px 6px; }
-  details { margin-top:6px; }
-  .nowrap{ white-space:nowrap; }
+  body{font-family:system-ui,Arial,sans-serif;margin:16px;}
+  h1{margin:0 0 12px;}
+  .controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;}
+  input,button,select{padding:6px 8px;font-size:14px;}
+  table{width:100%;border-collapse:collapse}
+  th,td{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}
+  .muted{opacity:.7;font-size:12px}
+  .mini{font-size:12px;width:100%;border-collapse:collapse;margin-top:4px}
+  .mini th,.mini td{border-bottom:1px dashed #eee;padding:4px 6px}
+  .chip{display:inline-block;padding:2px 6px;border-radius:999px;background:#e8f8e8;font-size:12px;margin-left:6px}
+  .nowrap{white-space:nowrap}
 </style>
 </head>
 <body>
-<h1>Market Explorer <span class="muted">(Polymarket & Myriad)</span></h1>
+<h1>Market Explorer <span class="muted">(stored in D1)</span></h1>
 
 <div class="controls">
+  <label>Worker:
+    <input id="workerBase" value="https://arbarbarb.rihardschnr2.workers.dev" style="width:360px">
+  </label>
   <label>Source:
-    <select id="source">
-      <option value="poly" selected>Polymarket</option>
-      <option value="myriad">Myriad (Polkamarkets)</option>
-    </select>
+    <select id="srcSel"><option value="poly" selected>Polymarket</option><option value="myriad">Myriad</option></select>
   </label>
-  <label>Filter: <input id="q" placeholder="type to filter by question/slug/title" /></label>
-  <label>Page size:
-    <select id="pageSize"><option>25</option><option>50</option><option selected>100</option><option>200</option></select>
-  </label>
-  <button id="refreshBtn" title="Fetch live from APIs">Refresh (live)</button>
-  <button id="loadCachedBtn" title="Load cached snapshot (KV/localStorage)">Load cached</button>
-  <button id="saveSnapBtn" title="Save current list to KV (requires admin token)">Save snapshot</button>
+  <label>Filter: <input id="q" placeholder="search question/slug/title"></label>
+  <label>Page size: <select id="pageSize"><option>25</option><option>50</option><option selected>100</option><option>200</option></select></label>
+  <button id="loadDbBtn">Load from DB</button>
   <span id="status" class="muted"></span>
 </div>
 
+<div class="controls">
+  <label class="muted">Admin token: <input id="admTok" type="password" placeholder="ADMIN_TOKEN" style="width:260px"></label>
+  <button id="ingestPoly">Ingest Polymarket → D1</button>
+  <button id="ingestMyriad">Ingest Myriad → D1</button>
+  <span id="ingestMsg" class="muted"></span>
+</div>
+
 <table>
-  <thead><tr><th>Question / Title</th><th class="nowrap">Market ID</th><th>Tokens / Prices</th></tr></thead>
+  <thead><tr><th>Question / Title</th><th class="nowrap">Market ID</th><th>Outcomes</th></tr></thead>
   <tbody id="tbody"></tbody>
 </table>
 
@@ -52,465 +52,10 @@
   <button id="nextBtn">Next →</button>
 </div>
 
-<script>
-// ---------- Config
-const PROXY = "https://arbarbarb.rihardschnr2.workers.dev/"; // your Cloudflare Worker (same as proxy)
-const SNAP_BASE = PROXY.replace(/\/+$/,''); // snapshots served by same Worker
-const GAMMA = "https://gamma-api.polymarket.com";
-const CLOB  = "https://clob.polymarket.com";
-const MYRIAD_BASE   = "https://api-production.polkamarkets.com/markets";
-const MYRIAD_PARAMS = "network_id=274133&state=open&land_ids=myriad-szn2-usdc-v33&per_page=100";
-
-// ---------- Proxy fetch (uses Worker)
-async function xfetch(url,{retries=4,backoff=500}={}){
-  const bust=`_=${Date.now()}`;
-  const proxied = `${PROXY}?url=${encodeURIComponent(url)}&${bust}`;
-  for(let a=0;a<retries;a++){
-    const r = await fetch(proxied, { method:"GET", cache:"no-store" });
-    if(r.status===429){ await new Promise(res=>setTimeout(res, backoff*(2**a))); continue; }
-    if(!r.ok) throw new Error(`Proxy HTTP ${r.status} for ${url}`);
-    const ct = r.headers.get("content-type")||"";
-    return ct.includes("application/json") ? r.json() : r.text();
-  }
-  throw new Error(`Retry limit reached for ${url}`);
-}
-
-// ---------- Snapshots (KV + localStorage)
-const LS_KEY = { poly: "SNAP_POLY", myriad: "SNAP_MYRIAD" };
-
-async function loadSnapshot(src){
-  // 1) localStorage
-  const ls = localStorage.getItem(LS_KEY[src]);
-  if (ls) {
-    try {
-      const parsed = JSON.parse(ls);
-      if (parsed && Array.isArray(parsed.rows)) return parsed;
-    } catch {}
-  }
-  // 2) Worker KV
-  const r = await fetch(`${SNAP_BASE}/snapshots/${src}`);
-  if (!r.ok) return null;
-  const data = await r.json();
-  try { localStorage.setItem(LS_KEY[src], JSON.stringify(data)); } catch(e){}
-  return data;
-}
-
-async function saveSnapshot(src, rows, adminToken){
-  const r = await fetch(`${SNAP_BASE}/admin/snapshots/${src}`, {
-    method: "POST",
-    headers: {
-      "Content-Type":"application/json",
-      "Authorization": "Bearer " + (adminToken || "")
-    },
-    body: JSON.stringify({ rows })
-  });
-  if (!r.ok) throw new Error((await r.text())||"snapshot save failed");
-  const data = await r.json();
-  try { localStorage.setItem(LS_KEY[src], JSON.stringify(data)); } catch(e){}
-  return data;
-}
-
-// ---------- State
-let RAW=[], VIEW=[], BY_ID={}, page=0;
-const sourceEl=document.getElementById('source');
-const qEl=document.getElementById('q');
-const pageSizeEl=document.getElementById('pageSize');
-const statusEl=document.getElementById('status');
-const tbody=document.getElementById('tbody');
-const pageInfo=document.getElementById('pageInfo');
-
-const refreshBtn = document.getElementById('refreshBtn');
-const loadCachedBtn = document.getElementById('loadCachedBtn');
-const saveSnapBtn = document.getElementById('saveSnapBtn');
-
-// ---------- UI wiring
-refreshBtn.onclick = () => load(true);           // force live
-loadCachedBtn.onclick = () => load(false);       // cached only
-document.getElementById('prevBtn').onclick = () => { if (page>0){ page--; render(); } };
-document.getElementById('nextBtn').onclick = () => { if ((page+1)*pageSize() < VIEW.length){ page++; render(); } };
-qEl.oninput = applyFilter;
-pageSizeEl.onchange = () => { page=0; render(); };
-// When switching sources, show cached snapshot (no live fetch).
-sourceEl.onchange = () => { load(false); };
-
-saveSnapBtn.onclick = async () => {
-  const tok = sessionStorage.getItem('PAIR_TOKEN') || "";
-  if (!tok) { setStatus("No admin token in this tab (use Pairs Admin → Use in this tab)."); return; }
-  try {
-    const src = sourceEl.value;
-    await saveSnapshot(src, RAW, tok);
-    setStatus(`Saved ${RAW.length} ${src==='poly'?'Polymarket':'Myriad'} rows to KV.`);
-  } catch(e) {
-    setStatus(`Snapshot save failed: ${e.message||e}`);
-  }
-};
-
-// ---------- Utils
-function pageSize(){ return parseInt(pageSizeEl.value,10)||100; }
-function parseIso(s){ const d=s?new Date(s):null; return isFinite(d)?d:null; }
-function escapeHtml(s){ return (s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function setStatus(s){ statusEl.textContent=s; }
-function today(){ const d=new Date(); d.setHours(0,0,0,0); return d; }
-const nf = (x,dp=2)=> (x==null?'—':Number(x).toLocaleString(undefined,{maximumFractionDigits:dp}));
-const pf = (x,dp=6)=> (x==null?'—':Number(x).toFixed(dp));
-
-// ---------- Polymarket loaders
-async function fetchAllClobMarkets(){
-  let cursor=""; const out=[];
-  while(true){
-    const url=`${CLOB}/markets${cursor?`?next_cursor=${encodeURIComponent(cursor)}`:""}`;
-    const data = await xfetch(url);
-    const arr = data?.data || [];
-    out.push(...arr);
-    cursor = data?.next_cursor;
-    setStatus(`Polymarket CLOB: ${out.length} markets loaded…`);
-    if(!cursor || cursor==="LTE=") break;
-    await new Promise(r=>setTimeout(r,200));
-  }
-  return out;
-}
-async function fetchAllGammaOpen(){
-  const limit=1000; let offset=0; const out=[];
-  while(true){
-    const url=`${GAMMA}/markets?closed=false&limit=${limit}&offset=${offset}`;
-    const chunk = await xfetch(url);
-    if(!Array.isArray(chunk)||chunk.length===0) break;
-    out.push(...chunk);
-    offset+=chunk.length;
-    setStatus(`Polymarket Gamma: ${out.length} open markets loaded…`);
-    if(chunk.length<limit) break;
-    await new Promise(r=>setTimeout(r,50));
-  }
-  return out;
-}
-async function loadPolymarket(){
-  const [clob,gamma]=await Promise.all([fetchAllClobMarkets(), fetchAllGammaOpen()]);
-  const byCond=new Map();
-  for(const m of clob){
-    const k=(m.conditionId||m.condition_id||m.condition_hash||"").toLowerCase();
-    if(k) byCond.set(k,m);
-  }
-  const now=today();
-  RAW = gamma
-    .filter(g => { const end=parseIso(g.endDateIso||g.endDate); return !end || end >= now; })
-    .map(g=>{
-      const condKey=String(g.conditionId||g.questionID||"").toLowerCase();
-      const cm=byCond.get(condKey)||{};
-      return {
-        src:"poly",
-        id:g.id, question:g.question, slug:g.slug,
-        endDateIso:g.endDateIso||g.endDate,
-        active:g.active, closed:g.closed,
-        outcomes:g.outcomes, clobTokenIds:g.clobTokenIds,
-        bestBid:g.bestBid, bestAsk:g.bestAsk,
-        clob:cm
-      };
-    })
-    .sort((a,b)=>{
-      const ea=parseIso(a.endDateIso)?.getTime()??Infinity;
-      const eb=parseIso(b.endDateIso)?.getTime()??Infinity;
-      return ea-eb;
-    });
-  BY_ID = Object.fromEntries(RAW.map(m=>[String(m.id), m]));
-  setStatus(`Polymarket: ${RAW.length} open, unexpired markets.`);
-  applyFilter();
-
-  // auto-save snapshot if admin token present (optional)
-  const tok = sessionStorage.getItem('PAIR_TOKEN') || "";
-  if (tok) { try { await saveSnapshot("poly", RAW, tok); } catch(e) { console.warn("snapshot save poly failed", e); } }
-}
-
-// ---------- Myriad loader (robust) — stores outcomes if present
-async function loadMyriad(){
-  const now = today();
-  const perPage = 100;
-  let pageNum = 1;
-  const all = [];
-
-  try {
-    while (true) {
-      const url = `${MYRIAD_BASE}?${MYRIAD_PARAMS}&page=${pageNum}`;
-      const resp = await xfetch(url);
-      const chunk = Array.isArray(resp) ? resp : (Array.isArray(resp?.data) ? resp.data : []);
-      setStatus(`Myriad: page ${pageNum} → ${chunk.length} markets`);
-      if (!chunk.length) break;
-      all.push(...chunk);
-      if (chunk.length < perPage) break; // no more pages
-      pageNum++;
-      await new Promise(r => setTimeout(r, 80));
-    }
-  } catch (e) {
-    console.error("Myriad fetch via Worker failed:", e);
-    setStatus(`Myriad fetch via Worker failed: ${e?.message || e}`);
-    return;
-  }
-
-  RAW = all
-    .filter(m => m?.state === "open")
-    .filter(m => { const end = parseIso(m.expires_at); return !end || end >= now; })
-    .map(m => ({
-      src: "myriad",
-      id: m.id, question: m.title, slug: m.slug,
-      endDateIso: m.expires_at,
-      active: true, closed: false,
-      liquidity: m.liquidity, volume: m.volume, volume24h: m.volume_24h,
-      users: m.users, tokenSymbol: m?.token?.symbol || "",
-      resolution_source: m.resolution_source || "",
-      outcomes: Array.isArray(m.outcomes) ? m.outcomes : [],
-      raw: m
-    }))
-    .sort((a,b)=>{
-      const ea = parseIso(a.endDateIso)?.getTime() ?? Infinity;
-      const eb = parseIso(b.endDateIso)?.getTime() ?? Infinity;
-      return ea - eb;
-    });
-
-  BY_ID = Object.fromEntries(RAW.map(m => [String(m.id), m]));
-  setStatus(`Myriad: ${RAW.length} open, unexpired markets.`);
-  applyFilter();
-
-  const tok = sessionStorage.getItem('PAIR_TOKEN') || "";
-  if (tok) { try { await saveSnapshot("myriad", RAW, tok); } catch(e) { console.warn("snapshot save myriad failed", e); } }
-}
-
-// ---------- Master loader
-// forceLive=true → fetch APIs and then save snapshot (if token present)
-// forceLive=false → only load snapshot; if none, just prompt to refresh
-async function load(forceLive){
-  setStatus("Loading…");
-  const src = sourceEl.value; // "poly" | "myriad"
-
-  if (!forceLive) {
-    const snap = await loadSnapshot(src);
-    if (snap && Array.isArray(snap.rows) && snap.rows.length) {
-      RAW = snap.rows;
-      BY_ID = Object.fromEntries(RAW.map(m => [String(m.id), m]));
-      setStatus(`${src==='poly'?'Polymarket':'Myriad'}: loaded ${RAW.length} from snapshot (updated ${snap.updatedAt || 'n/a'}).`);
-      applyFilter();
-      return;
-    }
-    setStatus("No snapshot found. Press “Refresh (live)”.");
-    return;
-  }
-
-  try{
-    if(src==="poly"){ await loadPolymarket(); }
-    else { await loadMyriad(); }
-  }catch(e){
-    console.error(e);
-    setStatus(`Failed to load: ${e?.message||e}`);
-  }
-}
-
-// ---------- Filter + render
-function applyFilter(){
-  const q=(qEl.value||"").toLowerCase();
-  VIEW = RAW.filter(m => (`${m.question} ${m.slug}`.toLowerCase()).includes(q));
-  page=0; render();
-}
-function render(){
-  tbody.innerHTML="";
-  const ps=pageSize();
-  const slice=VIEW.slice(page*ps,page*ps+ps);
-
-  for(const m of slice){
-    const tr=document.createElement('tr');
-
-    const tdQ=document.createElement('td');
-    const end=parseIso(m.endDateIso);
-    const endTxt=end?new Intl.DateTimeFormat(undefined,{year:'numeric',month:'short',day:'numeric'}).format(end):'';
-    const chip=`<span class="chip">${m.src==="poly"?"Polymarket":"Myriad"}</span>`;
-    tdQ.innerHTML=`<div>${escapeHtml(m.question)} ${chip}</div>
-                   <div class="muted">${escapeHtml(m.slug||'')} ${endTxt?` · ends ${endTxt}`:''}</div>`;
-    tr.appendChild(tdQ);
-
-    const tdId=document.createElement('td'); tdId.textContent=m.id; tr.appendChild(tdId);
-
-    const tdTok=document.createElement('td');
-    if(m.src==="poly"){
-      tdTok.innerHTML = `
-        <div class="muted">Best: ${m.bestBid!=null?pf(m.bestBid,2):'—'} / ${m.bestAsk!=null?pf(m.bestAsk,2):'—'}</div>
-        <div style="margin-top:6px;">
-          <button data-load-tokens="${m.id}">Load options</button>
-          <button data-view-json="${m.id}">View JSON</button>
-        </div>
-        <div id="tokens-${m.id}" class="muted" style="margin-top:6px;">—</div>
-        <div id="json-${m.id}" class="muted" style="margin-top:6px; display:none;"></div>
-      `;
-    } else {
-      const liq = nf(m.liquidity);
-      const vol = nf(m.volume);
-      const vol24 = nf(m.volume24h);
-      const users = m.users!=null ? Number(m.users).toLocaleString() : '—';
-      tdTok.innerHTML = `
-        <div class="muted">Token: ${escapeHtml(m.tokenSymbol||'—')} · Users: ${users}</div>
-        <div class="muted">Liquidity: ${liq} · 24h Vol: ${vol24} · Total Vol: ${vol}</div>
-        <div style="margin-top:6px;">
-          ${m.resolution_source ? `<a href="${m.resolution_source}" target="_blank" rel="noopener">Resolution source ↗</a>` : ''}
-          <button data-myriad-options="${m.id}" style="margin-left:8px;">Load options</button>
-          <button data-view-json="${m.id}" style="margin-left:8px;">View JSON</button>
-        </div>
-        <div id="mopts-${m.id}" class="muted" style="margin-top:6px;">—</div>
-        <div id="json-${m.id}" class="muted" style="margin-top:6px; display:none;"></div>
-      `;
-    }
-    tr.appendChild(tdTok);
-    tbody.appendChild(tr);
-  }
-
-  pageInfo.textContent = `Page ${VIEW.length ? page+1 : 0} of ${Math.ceil(VIEW.length/ps)} — ${VIEW.length} shown`;
-
-  // Wire buttons
-  tbody.querySelectorAll('button[data-load-tokens]').forEach(btn=>{
-    btn.onclick = () => loadPolyTokens(btn.getAttribute('data-load-tokens'));
-  });
-  tbody.querySelectorAll('button[data-myriad-options]').forEach(btn=>{
-    btn.onclick = () => loadMyriadOptions(btn.getAttribute('data-myriad-options'));
-  });
-  tbody.querySelectorAll('button[data-view-json]').forEach(btn=>{
-    btn.onclick = () => toggleJson(btn.getAttribute('data-view-json'));
-  });
-}
-
-// ---------- Polymarket tokens + order book (via Worker)
-async function loadPolyTokens(marketId){
-  const host=document.getElementById(`tokens-${marketId}`);
-  if(!host) return;
-  host.textContent="Loading options…";
-  const meta=BY_ID[String(marketId)]||{};
-  try{
-    let tokens=[], detail=null;
-    try{ detail=await xfetch(`${CLOB}/markets/${marketId}`);}catch(_){}
-    if(detail && Array.isArray(detail.tokens) && detail.tokens.length){
-      tokens=detail.tokens.map(t=>({id:t.id||t.token_id,label:t.name||t.label||t.ticker||t.outcome||'Outcome'}));
-    }else{
-      const ids=typeof meta.clobTokenIds==='string'?JSON.parse(meta.clobTokenIds):(meta.clobTokenIds||[]);
-      const outs=typeof meta.outcomes==='string'?JSON.parse(meta.outcomes):(meta.outcomes||[]);
-      tokens=ids.map((tid,i)=>({id:String(tid),label:String(outs[i]??`Outcome ${i+1}`)}));
-    }
-    if(!tokens.length){ host.textContent="No tokens found for this market."; return; }
-
-    const tbl=document.createElement('table'); tbl.className='mini';
-    tbl.innerHTML=`<thead><tr><th>Outcome</th><th>Token</th><th>Best bid</th><th>Best ask</th><th></th></tr></thead><tbody></tbody>`;
-    const body=tbl.querySelector('tbody');
-
-    for(const t of tokens){
-      const tr=document.createElement('tr');
-      tr.innerHTML=`<td>${escapeHtml(t.label)}</td>
-        <td><span class="token">${t.id}</span></td>
-        <td id="bb-${t.id}" class="muted">…</td>
-        <td id="ba-${t.id}" class="muted">…</td>
-        <td><button data-view-book="${t.id}">View book</button></td>`;
-      body.appendChild(tr);
-
-      xfetch(`${CLOB}/book?token_id=${encodeURIComponent(t.id)}`).then(book=>{
-        document.getElementById(`bb-${t.id}`).textContent = book?.bids?.[0]?.price?.toFixed(4) ?? '—';
-        document.getElementById(`ba-${t.id}`).textContent = book?.asks?.[0]?.price?.toFixed(4) ?? '—';
-      }).catch(_=>{
-        document.getElementById(`bb-${t.id}`).textContent='—';
-        document.getElementById(`ba-${t.id}`).textContent='—';
-      });
-    }
-    host.innerHTML=""; host.appendChild(tbl);
-    host.querySelectorAll('button[data-view-book]').forEach(btn=>{
-      btn.onclick=()=>viewBook(btn.getAttribute('data-view-book'),host);
-    });
-  }catch(e){ console.error(e); host.textContent="Failed to load options for this market."; }
-}
-
-async function viewBook(tokenId, host){
-  let existing=document.getElementById(`bookwrap-${tokenId}`);
-  if(existing){ existing.open=!existing.open; return; }
-  const det=document.createElement('details'); det.id=`bookwrap-${tokenId}`; det.open=true;
-  det.innerHTML=`<summary>Order book for ${tokenId}</summary><div id="book-${tokenId}" class="ladder">Loading…</div>`;
-  host.appendChild(det);
-  try{
-    const book=await xfetch(`${CLOB}/book?token_id=${encodeURIComponent(tokenId)}`);
-    const bids=(book?.bids||[]).slice(0,15).map(b=>`${Number(b.price).toFixed(4)} @ ${Number(b.size).toFixed(4)}`).join('<br/>')||'—';
-    const asks=(book?.asks||[]).slice(0,15).map(a=>`${Number(a.price).toFixed(4)} @ ${Number(a.size).toFixed(4)}`).join('<br/>')||'—';
-    document.getElementById(`book-${tokenId}`).innerHTML = `<div><b>Bids (top 15)</b><br/>${bids}</div><div><b>Asks (top 15)</b><br/>${asks}</div>`;
-  }catch(e){ console.error(e); document.getElementById(`book-${tokenId}`).textContent="Failed to load book."; }
-}
-
-// ---------- Myriad options (robust: list -> detail -> outcomes endpoint)
-async function loadMyriadOptions(marketId){
-  const host = document.getElementById(`mopts-${marketId}`);
-  if(!host) return;
-  host.textContent = "Loading options…";
-
-  try {
-    const m = BY_ID[String(marketId)] || {};
-    let outcomes = Array.isArray(m.outcomes) ? m.outcomes : [];
-
-    // Fallback 1: detail endpoint
-    if (!outcomes.length) {
-      const detail = await xfetch(`${MYRIAD_BASE}/${marketId}?network_id=274133`);
-      const obj = detail && detail.data ? detail.data : detail;
-      if (Array.isArray(obj?.outcomes)) outcomes = obj.outcomes;
-    }
-
-    // Fallback 2: explicit outcomes endpoint
-    if (!outcomes.length) {
-      const maybe = await xfetch(`${MYRIAD_BASE}/${marketId}/outcomes?network_id=274133`);
-      const arr = Array.isArray(maybe) ? maybe : (Array.isArray(maybe?.data) ? maybe.data : []);
-      if (arr.length) outcomes = arr;
-    }
-
-    if (!outcomes.length) {
-      host.textContent = "No options found for this market.";
-      return;
-    }
-
-    const tbl = document.createElement('table');
-    tbl.className = 'mini';
-    tbl.innerHTML = `
-      <thead><tr><th>Outcome</th><th>Price</th><th>Shares</th><th>Holders</th></tr></thead>
-      <tbody></tbody>
-    `;
-    const body = tbl.querySelector('tbody');
-
-    for (const o of outcomes) {
-      const title = o.title || o.name || `Outcome ${o.id ?? ''}`.trim();
-      const price = pf(o.price, 6);
-      const shares = nf(o.shares ?? o.shares_held, 4);
-      const holders = o.holders != null ? Number(o.holders).toLocaleString() : '—';
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${escapeHtml(title)}</td><td>${price}</td><td>${shares}</td><td>${holders}</td>`;
-      body.appendChild(tr);
-    }
-
-    host.innerHTML = "";
-    host.appendChild(tbl);
-  } catch (e) {
-    console.error(e);
-    host.textContent = "Failed to load options for this market.";
-  }
-}
-
-// ---------- JSON peek (both sources)
-function toggleJson(id){
-  const el=document.getElementById(`json-${id}`); if(!el) return;
-  if(el.style.display==="none"){
-    const m=BY_ID[String(id)];
-    el.textContent = JSON.stringify(m.src==="poly"?m:m.raw, null, 2);
-    el.style.display="block";
-  }else{
-    el.style.display="none";
-  }
-}
-
-// Initial status (no auto live fetch)
-// But we can try to show cached snapshot immediately for the default source:
-load(false);
-</script>
-
 <hr/>
 <div id="pairs-admin" style="margin-top:16px;">
   <h3>Pairs Admin <span class="muted">(Polymarket ↔ Myriad)</span></h3>
   <div class="controls">
-    <label>Worker:
-      <input id="pairBase" value="https://arbarbarb.rihardschnr2.workers.dev" style="width:360px;">
-    </label>
     <label>Admin token:
       <input id="pairTok" type="password" placeholder="paste ADMIN_TOKEN" style="width:260px;">
     </label>
@@ -522,10 +67,7 @@ load(false);
     <label>Polymarket ID: <input id="pairPoly" placeholder="e.g. 516710" style="width:160px;"></label>
     <label>Myriad ID: <input id="pairMyriad" placeholder="e.g. 134" style="width:160px;"></label>
     <label>Direction:
-      <select id="pairDir">
-        <option value="same" selected>same</option>
-        <option value="inverse">inverse</option>
-      </select>
+      <select id="pairDir"><option value="same">same</option><option value="inverse">inverse</option></select>
     </label>
   </div>
 
@@ -551,125 +93,213 @@ load(false);
 </div>
 
 <script>
-(function(){
-  const el = (id)=>document.getElementById(id);
-  const sset = (k,v)=>sessionStorage.setItem(k,v);
-  const sget = (k)=>sessionStorage.getItem(k)||"";
-  const ok = (n,t)=>{ n.textContent=t; n.style.color="#137333"; };
-  const err = (n,t)=>{ n.textContent=t; n.style.color="#B00020"; };
+const el = id => document.getElementById(id);
+const nf = (x,dp=2)=> (x==null?'—':Number(x).toLocaleString(undefined,{maximumFractionDigits:dp}));
+const pf = (x,dp=6)=> (x==null?'—':Number(x).toFixed(dp));
 
-  const baseEl = el('pairBase'), tokEl = el('pairTok'), useBtn = el('pairUse'), authMsg = el('pairAuthMsg');
-  const polyEl = el('pairPoly'), myrEl = el('pairMyriad'), dirEl = el('pairDir'), mapEl = el('pairMap'), notesEl = el('pairNotes');
-  const createBtn = el('pairCreate'), upsertBtn = el('pairUpsert'), delBtn = el('pairDelete'), refBtn = el('pairRefresh');
-  const msgEl = el('pairMsg'), tbl = el('pairTable');
+const baseEl=el('workerBase'), srcEl=el('srcSel'), qEl=el('q'), psEl=el('pageSize'), statusEl=el('status');
+const tbody=el('tbody'), pageInfo=el('pageInfo');
+const loadDbBtn=el('loadDbBtn'), prevBtn=el('prevBtn'), nextBtn=el('nextBtn');
 
-  // Pre-fill from session
-  baseEl.value = sget('PAIR_BASE') || baseEl.value;
-  tokEl.value = sget('PAIR_TOKEN') || "";
+const admTok=el('admTok'), ingestPoly=el('ingestPoly'), ingestMyriad=el('ingestMyriad'), ingestMsg=el('ingestMsg');
 
-  useBtn.onclick = ()=>{ sset('PAIR_BASE', baseEl.value.trim()); sset('PAIR_TOKEN', tokEl.value.trim()); ok(authMsg,"Token set for this tab."); };
+let ALL=[], VIEW=[], page=0;
 
-  async function call(method, path, body){
-    const url = baseEl.value.replace(/\/+$/,'') + path;
-    const r = await fetch(url, {
-      method,
-      headers: {
-        'Content-Type':'application/json',
-        'Authorization': 'Bearer ' + (sget('PAIR_TOKEN')||''),
-      },
-      body: body ? JSON.stringify(body) : undefined
-    });
-    const ct = r.headers.get('content-type')||'';
-    const data = ct.includes('json') ? await r.json() : await r.text();
-    if(!r.ok) throw new Error((data && data.error) || r.statusText);
-    return data;
-  }
-
-  function parseMap(){
-    const t = mapEl.value.trim();
-    if(!t) return [];
-    try { const j = JSON.parse(t); return Array.isArray(j)?j:[]; } catch(e){ throw new Error('Invalid outcome map JSON'); }
-  }
-
-  async function create(){
-    try{
-      const payload = {
-        polyId: polyEl.value.trim(),
-        myriadId: myrEl.value.trim(),
-        direction: dirEl.value,
-        map: parseMap(),
-        notes: notesEl.value.trim(),
-      };
-      if(!payload.polyId || !payload.myriadId) throw new Error('polyId and myriadId required');
-      await call('POST','/admin/pairs', payload);
-      ok(msgEl,'Created.'); await refresh();
-    }catch(e){ err(msgEl,e.message); }
-  }
-  async function upsert(){
-    try{
-      const polyId = polyEl.value.trim(), myriadId = myrEl.value.trim();
-      if(!polyId || !myriadId) throw new Error('polyId and myriadId required');
-      await call('PUT', `/admin/pairs/${encodeURIComponent(polyId)}/${encodeURIComponent(myriadId)}`, {
-        direction: dirEl.value, map: parseMap(), notes: notesEl.value.trim()
-      });
-      ok(msgEl,'Upserted.'); await refresh();
-    }catch(e){ err(msgEl,e.message); }
-  }
-  async function del(){
-    try{
-      const polyId = polyEl.value.trim(), myriadId = myrEl.value.trim();
-      if(!polyId || !myriadId) throw new Error('polyId and myriadId required');
-      await call('DELETE', `/admin/pairs/${encodeURIComponent(polyId)}/${encodeURIComponent(myriadId)}`);
-      ok(msgEl,'Deleted.'); await refresh();
-    }catch(e){ err(msgEl,e.message); }
-  }
-  async function refresh(){
-    try{
-      msgEl.textContent = 'Loading…';
-      const data = await fetch(baseEl.value.replace(/\/+$/,'') + '/pairs').then(r=>r.json());
-      const pairs = data.pairs || [];
-      tbl.innerHTML = '';
-      for(const p of pairs){
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-          <td>${p.polyId}</td>
-          <td>${p.myriadId}</td>
-          <td>${p.direction||'same'}</td>
-          <td><code>${JSON.stringify(p.map||[])}</code></td>
-          <td>${p.notes||''}</td>
-          <td class="muted">${p.at||''}</td>
-          <td><button data-edit="${p.polyId}|${p.myriadId}">Edit</button></td>`;
-        tbl.appendChild(tr);
-      }
-      tbl.querySelectorAll('button[data-edit]').forEach(btn=>{
-        btn.onclick = ()=>{
-          const [polyId,myriadId] = btn.getAttribute('data-edit').split('|');
-          const p = (pairs||[]).find(x => String(x.polyId)===polyId && String(x.myriadId)===myriadId);
-          if(!p) return;
-          polyEl.value = p.polyId; myrEl.value = p.myriadId;
-          dirEl.value = p.direction||'same'; mapEl.value = JSON.stringify(p.map||[], null, 2);
-          notesEl.value = p.notes||'';
-          window.scrollTo({top:0,behavior:'smooth'});
-        };
-      });
-      ok(msgEl, `${pairs.length} pairs`);
-    }catch(e){ err(msgEl, e.message); }
-  }
-
-  createBtn.onclick = create; upsertBtn.onclick = upsert; delBtn.onclick = del; refBtn.onclick = refresh;
-  refresh();
-
-  // Bonus: row helpers — click table row to prefill IDs for quick pairing
-  document.getElementById('tbody').addEventListener('click', (ev)=>{
-    const tr = ev.target.closest('tr'); if(!tr) return;
-    const idTd = tr.children[1]; const id = idTd?.textContent?.trim();
-    const chip = tr.querySelector('.chip')?.textContent || '';
-    if(!id) return;
-    if(chip.includes('Polymarket')) el('pairPoly').value = id;
-    if(chip.includes('Myriad'))    el('pairMyriad').value = id;
+async function api(path, {method="GET", body=null, token=null}={}) {
+  const url = baseEl.value.replace(/\/+$/,'') + path;
+  const r = await fetch(url, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: "Bearer "+token } : {})
+    },
+    body: body ? JSON.stringify(body) : undefined,
   });
-})();
-</script>
+  const ct = r.headers.get('content-type')||'';
+  const data = ct.includes('json') ? await r.json() : await r.text();
+  if (!r.ok) throw new Error((data && data.error) || r.statusText);
+  return data;
+}
 
+async function loadFromDB() {
+  statusEl.textContent = "Loading from D1…";
+  const src = srcEl.value;
+  const q = encodeURIComponent(qEl.value||"");
+  const data = await api(`/markets?src=${src}&q=${q}&limit=1000&offset=0`);
+  ALL = data.markets || [];
+  VIEW = ALL.slice();
+  page = 0;
+  render();
+  statusEl.textContent = `${VIEW.length} markets from D1`;
+}
+
+function applyFilter() {
+  const q = (qEl.value||'').toLowerCase();
+  VIEW = ALL.filter(m => (`${(m.question||'')} ${(m.slug||'')}`.toLowerCase()).includes(q));
+  page = 0;
+  render();
+}
+
+function render() {
+  tbody.innerHTML = '';
+  const ps = parseInt(psEl.value,10)||100;
+  const slice = VIEW.slice(page*ps, page*ps+ps);
+
+  for (const m of slice) {
+    const tr = document.createElement('tr');
+    const chip = `<span class="chip">${m.src==="poly"?"Polymarket":"Myriad"}</span>`;
+    const endTxt = m.end_date ? new Intl.DateTimeFormat(undefined,{year:'numeric',month:'short',day:'numeric'}).format(new Date(m.end_date)) : '';
+    tr.innerHTML = `
+      <td><div>${escapeHtml(m.question||'')} ${chip}</div><div class="muted">${escapeHtml(m.slug||'')}${endTxt?` · ends ${endTxt}`:''}</div></td>
+      <td>${m.id}</td>
+      <td>
+        <button data-outcomes="${m.src}|${m.id}">Load outcomes</button>
+        <div id="oc-${m.src}-${m.id}" class="muted" style="margin-top:6px;">—</div>
+      </td>`;
+    tbody.appendChild(tr);
+  }
+
+  pageInfo.textContent = `Page ${VIEW.length ? page+1 : 0} of ${Math.ceil(VIEW.length/ps)} — ${VIEW.length} shown`;
+
+  tbody.querySelectorAll('button[data-outcomes]').forEach(btn=>{
+    btn.onclick = () => loadOutcomes(btn.getAttribute('data-outcomes'));
+  });
+}
+
+async function loadOutcomes(key) {
+  const [src,id] = key.split('|');
+  const host = el(`oc-${src}-${id}`);
+  if (!host) return;
+  host.textContent = "Loading…";
+  const data = await api(`/outcomes?src=${encodeURIComponent(src)}&market_id=${encodeURIComponent(id)}`);
+  const outs = data.outcomes || [];
+  if (!outs.length) { host.textContent = "No outcomes stored."; return; }
+
+  const tbl = document.createElement('table');
+  tbl.className='mini';
+  tbl.innerHTML = `<thead><tr><th>Outcome</th><th>Price</th><th>Shares</th><th>Holders</th></tr></thead><tbody></tbody>`;
+  const body = tbl.querySelector('tbody');
+  for (const o of outs) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${escapeHtml(o.label||'')}</td><td>${pf(o.price,6)}</td><td>${nf(o.shares,4)}</td><td>${o.holders==null?'—':nf(o.holders,0)}</td>`;
+    body.appendChild(tr);
+  }
+  host.innerHTML = ""; host.appendChild(tbl);
+}
+
+function escapeHtml(s){ return (s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+// paging + filter
+qEl.oninput = applyFilter;
+psEl.onchange = ()=>{ page=0; render(); };
+prevBtn.onclick = ()=>{ if(page>0){ page--; render(); } };
+nextBtn.onclick = ()=>{ const ps=parseInt(psEl.value,10)||100; if((page+1)*ps<VIEW.length){ page++; render(); } };
+loadDbBtn.onclick = loadFromDB;
+
+// admin: ingest
+async function doIngest(which){
+  ingestMsg.textContent = `Ingesting ${which}…`;
+  try {
+    const path = which==='poly'? '/admin/ingest/poly' : '/admin/ingest/myriad';
+    const res = await api(path, {method:'POST', token: admTok.value.trim()});
+    ingestMsg.textContent = `Done: ${JSON.stringify(res)}`;
+  } catch(e) {
+    ingestMsg.textContent = e.message;
+  }
+}
+ingestPoly.onclick = ()=>doIngest('poly');
+ingestMyriad.onclick = ()=>doIngest('myriad');
+
+// ------- Pairs Admin (D1) -------
+const pairTok = el('pairTok'), pairUse = el('pairUse'), pairAuthMsg = el('pairAuthMsg');
+const pairPoly = el('pairPoly'), pairMyriad = el('pairMyriad'), pairDir = el('pairDir');
+const pairMap = el('pairMap'), pairNotes = el('pairNotes'), pairMsg = el('pairMsg'), pairTable = el('pairTable');
+const pairCreate = el('pairCreate'), pairUpsert=el('pairUpsert'), pairDelete = el('pairDelete'), pairRefresh = el('pairRefresh');
+
+pairUse.onclick = ()=>{ pairAuthMsg.textContent="Token set."; };
+
+function parseMap() {
+  const t = pairMap.value.trim(); if(!t) return [];
+  try { const j = JSON.parse(t); return Array.isArray(j)?j:[]; } catch { throw new Error('Invalid outcome map JSON'); }
+}
+
+async function pairsRefresh() {
+  try {
+    pairMsg.textContent = "Loading…";
+    const p = await api('/pairs');
+    const rows = p.pairs || [];
+    pairTable.innerHTML = '';
+    for (const r of rows) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${r.poly_id}</td>
+        <td>${r.myriad_id}</td>
+        <td>${r.direction||'same'}</td>
+        <td><code>${r.map_json||'[]'}</code></td>
+        <td>${r.notes||''}</td>
+        <td class="muted">${r.updated_at||''}</td>
+        <td><button data-edit="${r.poly_id}|${r.myriad_id}">Edit</button></td>`;
+      pairTable.appendChild(tr);
+    }
+    pairTable.querySelectorAll('button[data-edit]').forEach(btn=>{
+      btn.onclick = ()=>{
+        const [pid,mid] = btn.getAttribute('data-edit').split('|');
+        const r = (p.pairs||[]).find(x=> String(x.poly_id)===pid && String(x.myriad_id)===mid);
+        pairPoly.value = r.poly_id; pairMyriad.value = r.myriad_id;
+        pairDir.value = r.direction||'same';
+        pairMap.value = r.map_json || '[]';
+        pairNotes.value = r.notes||'';
+        window.scrollTo({top:0,behavior:'smooth'});
+      };
+    });
+    pairMsg.textContent = `${rows.length} pairs`;
+  } catch(e) { pairMsg.textContent = e.message; }
+}
+
+async function pairCreateFn() {
+  try{
+    const body = {
+      polyId: pairPoly.value.trim(),
+      myriadId: pairMyriad.value.trim(),
+      direction: pairDir.value,
+      map: parseMap(),
+      notes: pairNotes.value.trim(),
+    };
+    if(!body.polyId || !body.myriadId) throw new Error('polyId and myriadId required');
+    await api('/admin/pairs', {method:'POST', token: pairTok.value.trim(), body});
+    pairMsg.textContent = 'Created.'; pairsRefresh();
+  }catch(e){ pairMsg.textContent = e.message; }
+}
+async function pairUpsertFn() {
+  try{
+    const polyId = pairPoly.value.trim(), myriadId = pairMyriad.value.trim();
+    if(!polyId || !myriadId) throw new Error('polyId and myriadId required');
+    await api(`/admin/pairs/${encodeURIComponent(polyId)}/${encodeURIComponent(myriadId)}`, {
+      method:'PUT', token: pairTok.value.trim(),
+      body: { direction: pairDir.value, map: parseMap(), notes: pairNotes.value.trim() }
+    });
+    pairMsg.textContent = 'Upserted.'; pairsRefresh();
+  }catch(e){ pairMsg.textContent = e.message; }
+}
+async function pairDeleteFn() {
+  try{
+    const polyId = pairPoly.value.trim(), myriadId = pairMyriad.value.trim();
+    if(!polyId || !myriadId) throw new Error('polyId and myriadId required');
+    await api(`/admin/pairs/${encodeURIComponent(polyId)}/${encodeURIComponent(myriadId)}`, {
+      method:'DELETE', token: pairTok.value.trim()
+    });
+    pairMsg.textContent = 'Deleted.'; pairsRefresh();
+  }catch(e){ pairMsg.textContent = e.message; }
+}
+
+pairCreate.onclick = pairCreateFn;
+pairUpsert.onclick = pairUpsertFn;
+pairDelete.onclick = pairDeleteFn;
+pairRefresh.onclick = pairsRefresh;
+
+// Start
+statusEl.textContent = "Press 'Load from DB' or run an ingest.";
+pairsRefresh();
+</script>
 </body>
 </html>
