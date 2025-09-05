@@ -3,11 +3,12 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Market Explorer (D1-backed)</title>
+<title>Market Explorer (D1-backed, hybrid + pairing UX)</title>
 <style>
   body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:16px; }
   h1 { margin:0 0 12px; font-size:28px; }
-  .muted { opacity:.7; font-size:12px; }
+  h3 { margin:12px 0 6px; }
+  .muted { opacity:.75; font-size:12px; }
   .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:10px 0; }
   input,button,select { padding:6px 8px; font-size:14px; }
   input[type="text"], input[type="password"] { min-width:220px; }
@@ -17,9 +18,10 @@
   .mini { width:100%; border-collapse:collapse; font-size:12px; margin-top:6px; }
   .mini th,.mini td { padding:4px 6px; border-bottom:1px dashed #efefef; }
   .nowrap{ white-space:nowrap; }
-  details { margin-top:6px; }
   .ok { color:#137333; }
   .err{ color:#b00020; }
+  .pill { display:inline-block; padding:2px 6px; border-radius:999px; background:#f3f3f3; font-size:12px; margin:2px 4px 0 0; }
+  details { margin-top:6px; }
 </style>
 </head>
 <body>
@@ -47,6 +49,7 @@
   </label>
 
   <button id="btnLoadFromDb">Load from DB</button>
+  <button id="btnExportNames">Export market names (.txt)</button>
   <span id="dbStatus" class="muted">0 markets from D1</span>
 </div>
 
@@ -79,7 +82,7 @@
     <tr>
       <th>Question / Title</th>
       <th class="nowrap">Market ID</th>
-      <th>Outcomes</th>
+      <th>Actions / Data</th>
     </tr>
   </thead>
   <tbody id="tbody"></tbody>
@@ -87,7 +90,7 @@
 
 <hr/>
 
-<h3>Pairs Admin <span class="muted">(Polymarket ↔ Myriad)</span></h3>
+<h3>Pair markets by <em>name</em> (with outcome dropdowns)</h3>
 
 <div class="controls">
   <label>Admin token:
@@ -98,33 +101,51 @@
 </div>
 
 <div class="controls">
-  <label>Polymarket ID: <input id="pairPoly" placeholder="e.g. 516710" style="width:160px;"></label>
-  <label>Myriad ID: <input id="pairMyriad" placeholder="e.g. 134" style="width:160px;"></label>
+  <button id="loadNameLists">Load market names</button>
+  <span class="muted">This fills the dropdowns below with titles from D1.</span>
+</div>
+
+<div class="controls">
+  <label>Polymarket title:
+    <select id="polyTitleSel" style="min-width:360px;"></select>
+  </label>
+  <label>Myriad title:
+    <select id="myrTitleSel" style="min-width:360px;"></select>
+  </label>
+</div>
+
+<div class="controls">
+  <label>Poly outcomes:
+    <select id="polyOutSel" style="min-width:260px;"></select>
+  </label>
+  <label>Myriad outcomes:
+    <select id="myrOutSel" style="min-width:260px;"></select>
+  </label>
+  <button id="addOutcomePair">Add outcome pair</button>
+</div>
+
+<div class="controls">
   <label>Direction:
     <select id="pairDir">
-      <option value="same">same</option>
+      <option value="same" selected>same</option>
       <option value="inverse">inverse</option>
     </select>
   </label>
+  <label>Notes: <input id="pairNotes" style="width:360px;"></label>
 </div>
 
 <div class="controls">
-  <label>Outcome map (JSON):
-    <input id="pairMap" placeholder='[{"poly":"Yes","myriad":"≥ $125K"},{"poly":"No","myriad":"≤ $105K"}]' style="width:560px;">
-  </label>
-  <label>Notes: <input id="pairNotes" style="width:260px;"></label>
-</div>
-
-<div class="controls">
-  <button id="pairCreate">Create</button>
-  <button id="pairUpsert">Upsert</button>
-  <button id="pairDelete" style="background:#fee;border:1px solid #f99;">Delete</button>
-  <button id="pairRefresh">Refresh list</button>
+  <button id="savePair">Save Pair (Create/Upsert)</button>
+  <button id="pairRefresh">Refresh pair list</button>
   <span id="pairMsg" class="muted"></span>
 </div>
 
-<table class="mini" style="width:100%;">
-  <thead><tr><th>Polymarket</th><th>Myriad</th><th>Dir</th><th>Map</th><th>Notes</th><th>Updated</th><th></th></tr></thead>
+<div class="controls">
+  <div id="outcomeMapPreview" class="muted">Outcome map: []</div>
+</div>
+
+<table class="mini" style="width:100%; margin-top:6px;">
+  <thead><tr><th>Polymarket</th><th>Myriad</th><th>Dir</th><th>Map</th><th>Notes</th><th>Updated</th></tr></thead>
   <tbody id="pairTable"></tbody>
 </table>
 
@@ -140,6 +161,8 @@ function parseIso(s){ const d=s?new Date(s):null; return isFinite(d)?d:null; }
 function getBase(){ return ($('workerBase').value||'').replace(/\/+$/,''); }
 function getToken(){ return sget('PAIR_TOKEN') || $('topAdminTok').value || $('pairTok').value || ''; }
 const pf = (x,dp=6)=> (x==null?'—':Number(x).toFixed(dp));
+const nf = (x,dp=2)=> (x==null?'—':Number(x).toLocaleString(undefined,{maximumFractionDigits:dp}));
+const PROXY = (absoluteUrl)=> getBase() + '/?url=' + encodeURIComponent(absoluteUrl);
 
 /* ================================
    Global state for list view
@@ -179,61 +202,41 @@ async function apiPut(path, body, auth=true){
   if (!r.ok || data.ok === false) throw new Error((data && data.error) || r.statusText);
   return data;
 }
-async function apiDel(path, auth=true){
-  const url = getBase() + path;
-  const headers = {};
-  if (auth) headers['Authorization'] = 'Bearer ' + getToken();
-  const r = await fetch(url, { method:'DELETE', headers });
-  const data = await r.json().catch(()=>({}));
-  if (!r.ok || data.ok === false) throw new Error((data && data.error) || r.statusText);
-  return data;
-}
 
 /* ================================
    HYBRID Polymarket ingest
-   - Browser fetches Gamma (with proxy fallback)
-   - Posts page to /admin/ingest/polyPage
 ==================================*/
 const GAMMA = "https://gamma-api.polymarket.com";
-
 async function fetchGammaPage(limit, offset){
   const directUrl = `${GAMMA}/markets?closed=false&limit=${limit}&offset=${offset}`;
-  // Try direct first
   try{
     const r = await fetch(directUrl, { headers:{ 'accept':'application/json' }, cache:'no-store' });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return await r.json();
   }catch(_){
-    // Fallback to Worker proxy (?url=)
-    const proxyUrl = getBase() + `/?url=` + encodeURIComponent(directUrl);
-    const r2 = await fetch(proxyUrl, { headers:{ 'accept':'application/json' }, cache:'no-store' });
+    const r2 = await fetch(PROXY(directUrl), { headers:{ 'accept':'application/json' }, cache:'no-store' });
     if (!r2.ok) throw new Error(`Proxy HTTP ${r2.status}`);
     return await r2.json();
   }
 }
-
-async function ingestPolyHybrid({ limit=400, maxPages=10 } = {}){
+async function ingestPolyHybrid({ limit=400, maxPages=20 } = {}){
   const out = $('ingMsg');
   if(!getBase() || !getToken()){ out.textContent='Set worker URL and admin token first.'; out.className='muted err'; return; }
   out.textContent='Hybrid ingest starting…'; out.className='muted';
 
   let offset = 0, page = 0, totalStored = 0;
-
   try{
     while(page < maxPages){
-      const arr = await fetchGammaPage(limit, offset);
-      const gamma = Array.isArray(arr) ? arr : [];
-      if(!gamma.length){ break; }
+      const gamma = await fetchGammaPage(limit, offset);
+      const arr = Array.isArray(gamma) ? gamma : [];
+      if(!arr.length) break;
 
-      // POST to worker (bulk write)
-      const res = await apiPost('/admin/ingest/polyPage', { markets: gamma }, true);
+      const res = await apiPost('/admin/ingest/polyPage', { markets: arr }, true);
       totalStored += res.stored || 0;
 
-      offset += gamma.length;
-      page++;
+      offset += arr.length; page++;
       out.textContent = `Hybrid ingest: page ${page}, +${res.stored||0} (total ${totalStored})`;
-
-      if (gamma.length < limit) break; // last page
+      if (arr.length < limit) break;
     }
     out.textContent = `Hybrid ingest done. Stored ${totalStored}.`; out.className='muted ok';
     OFFSET = 0; await loadFromDb();
@@ -241,10 +244,6 @@ async function ingestPolyHybrid({ limit=400, maxPages=10 } = {}){
     out.textContent = 'Hybrid error: ' + e.message; out.className='muted err';
   }
 }
-
-/* ================================
-   Server-only ingest (one page)
-==================================*/
 async function ingestPolyServerOnce({ limit=400, offset=0 } = {}){
   const out = $('ingMsg');
   if(!getBase() || !getToken()){ out.textContent='Set worker URL and admin token first.'; out.className='muted err'; return; }
@@ -257,10 +256,6 @@ async function ingestPolyServerOnce({ limit=400, offset=0 } = {}){
     out.textContent = 'Server ingest error: ' + e.message; out.className='muted err';
   }
 }
-
-/* ================================
-   Myriad ingest
-==================================*/
 async function ingestMyriadOnce(){
   const out = $('ingMsg');
   if(!getBase() || !getToken()){ out.textContent='Set worker URL and admin token first.'; out.className='muted err'; return; }
@@ -294,50 +289,24 @@ async function loadFromDb(){
 }
 
 /* ================================
-   Render + outcomes loader
+   Row actions: Outcomes / Liquidity / Orderbook
 ==================================*/
-function render(){
-  const tbody = $('tbody');
-  tbody.innerHTML = '';
-  for(const m of CURRENT){
-    const tr = document.createElement('tr');
-
-    const tdQ = document.createElement('td');
-    const end = parseIso(m.end_date);
-    const endTxt = end ? new Intl.DateTimeFormat(undefined,{year:'numeric',month:'short',day:'numeric'}).format(end) : '';
-    const chip = `<span class="chip">${m.src==='poly'?'Polymarket':'Myriad'}</span>`;
-    tdQ.innerHTML = `<div>${escapeHtml(m.question)} ${chip}</div>
-                     <div class="muted">${escapeHtml(m.slug||'')}${endTxt?` · ends ${endTxt}`:''}</div>`;
-    tr.appendChild(tdQ);
-
-    const tdId = document.createElement('td'); tdId.textContent = m.id; tr.appendChild(tdId);
-
-    const tdO = document.createElement('td');
-    tdO.innerHTML = `
-      <button data-load-out="${m.src}|${m.id}">Load outcomes</button>
-      <div id="out-${m.src}-${m.id}" class="muted" style="margin-top:6px;">—</div>`;
-    tr.appendChild(tdO);
-
-    tbody.appendChild(tr);
-  }
-  const ps = parseInt($('pageSize').value,10)||100;
-  $('pageInfo').textContent = `Page ${LAST_COUNT ? (Math.floor(OFFSET/ps)+1) : 0}`;
-  tbody.querySelectorAll('button[data-load-out]').forEach(btn=>{
-    btn.onclick = () => {
-      const [src,id] = btn.getAttribute('data-load-out').split('|');
-      loadOutcomes(src,id);
-    };
-  });
-}
+const CLOB = "https://clob.polymarket.com";
+const MYRIAD_BASE = "https://api-production.polkamarkets.com/markets";
 
 async function loadOutcomes(src, marketId){
   const host = $(`out-${src}-${marketId}`);
   if(!host) return;
-  host.textContent = 'Loading…';
+  host.textContent = 'Loading outcomes…';
   try{
     const data = await apiGet(`/outcomes?src=${encodeURIComponent(src)}&market_id=${encodeURIComponent(marketId)}`);
     const outs = data.outcomes || [];
-    if(!outs.length){ host.textContent='No outcomes found.'; return; }
+    if(!outs.length){
+      host.innerHTML = (src==='poly')
+        ? `<span class="err">No Polymarket outcomes found in DB.</span>`
+        : `No outcomes found.`;
+      return;
+    }
     const tbl = document.createElement('table');
     tbl.className='mini';
     tbl.innerHTML = `<thead><tr><th>Outcome</th><th>Price</th><th>Shares</th><th>Holders</th></tr></thead><tbody></tbody>`;
@@ -356,94 +325,301 @@ async function loadOutcomes(src, marketId){
   }
 }
 
-/* ================================
-   Pairs Admin (CRUD)
-==================================*/
-(function(){
-  const tokEl = $('pairTok'), useBtn = $('pairUse'), authMsg = $('pairAuthMsg');
-  const polyEl = $('pairPoly'), myrEl = $('pairMyriad'), dirEl = $('pairDir'), mapEl = $('pairMap'), notesEl = $('pairNotes');
-  const table = $('pairTable'), msgEl = $('pairMsg');
+async function loadLiquidity(src, marketId){
+  const el = $(`liq-${src}-${marketId}`);
+  if(!el) return;
+  el.textContent='Loading liquidity…';
+  try{
+    if(src==='myriad'){
+      // Fetch fresh from Myriad API (proxy through worker for CORS safety)
+      const u = `${MYRIAD_BASE}/${marketId}?network_id=274133`;
+      const r = await fetch(PROXY(u)); if(!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      const m = j?.data || j;
+      const liq = m?.liquidity, vol24 = m?.volume_24h, vol = m?.volume;
+      el.innerHTML = `Liquidity: <b>${nf(liq)}</b> · 24h Vol: ${nf(vol24)} · Total Vol: ${nf(vol)}`;
+    }else{
+      // Polymarket: approximate from top-of-book across tokens (best size sums)
+      // 1) get tokens for this market
+      const u = `${CLOB}/markets/${marketId}`;
+      const r = await fetch(PROXY(u)); if(!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      const tokens = Array.isArray(j?.tokens) ? j.tokens : [];
+      if(!tokens.length){ el.innerHTML = `<span class="muted">No token list available.</span>`; return; }
 
+      let bestBidSz = 0, bestAskSz = 0, bestBid=null, bestAsk=null, counted=0;
+      for(const t of tokens){
+        const bookU = `${CLOB}/book?token_id=${encodeURIComponent(t.id||t.token_id)}`;
+        const rr = await fetch(PROXY(bookU)); if(!rr.ok) continue;
+        const b = await rr.json();
+        if(b?.bids?.length){ bestBidSz += Number(b.bids[0].size)||0; if(bestBid==null) bestBid = b.bids[0].price; }
+        if(b?.asks?.length){ bestAskSz += Number(b.asks[0].size)||0; if(bestAsk==null) bestAsk = b.asks[0].price; }
+        counted++;
+        // don’t overdo subrequests in UI:
+        if(counted>=6) break;
+      }
+      const spread = (bestBid!=null && bestAsk!=null) ? `${pf(bestBid,4)} / ${pf(bestAsk,4)} (spr ${pf(bestAsk-bestBid,4)})` : '—';
+      el.innerHTML = `Approx. top depth (sum of best sizes across tokens): Bid ${pf(bestBidSz,4)} · Ask ${pf(bestAskSz,4)} · ${spread}`;
+    }
+  }catch(e){
+    el.textContent = 'Failed: ' + e.message;
+  }
+}
+
+async function loadPmOrderbook(marketId){
+  const host = $(`ob-poly-${marketId}`);
+  if(!host) return;
+  host.textContent='Loading order book…';
+  try{
+    // 1) tokens for the market
+    const u = `${CLOB}/markets/${marketId}`;
+    const r = await fetch(PROXY(u)); if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    const tokens = Array.isArray(j?.tokens) ? j.tokens : [];
+    if(!tokens.length){ host.textContent='No tokens.'; return; }
+
+    // 2) per token top-15 ladders
+    const wrap = document.createElement('div');
+    for(const t of tokens){
+      const bookU = `${CLOB}/book?token_id=${encodeURIComponent(t.id||t.token_id)}`;
+      const rr = await fetch(PROXY(bookU)); if(!rr.ok) continue;
+      const b = await rr.json();
+      const bids = (b?.bids||[]).slice(0,15);
+      const asks = (b?.asks||[]).slice(0,15);
+
+      const sec = document.createElement('details'); sec.open=false;
+      sec.innerHTML = `<summary>${escapeHtml(t.name||t.label||t.ticker||String(t.id||t.token_id))}</summary>`;
+      const grid = document.createElement('div'); grid.style.display='grid'; grid.style.gridTemplateColumns='1fr 1fr'; grid.style.gap='10px'; grid.style.marginTop='6px';
+
+      const colB = document.createElement('div');
+      colB.innerHTML = `<b>Bids (top 15)</b><br>` + (bids.length? bids.map(x=>`${pf(x.price,4)} @ ${pf(x.size,4)}`).join('<br>') : '—');
+
+      const colA = document.createElement('div');
+      colA.innerHTML = `<b>Asks (top 15)</b><br>` + (asks.length? asks.map(x=>`${pf(x.price,4)} @ ${pf(x.size,4)}`).join('<br>') : '—');
+
+      grid.appendChild(colB); grid.appendChild(colA);
+      sec.appendChild(grid);
+      wrap.appendChild(sec);
+    }
+    host.innerHTML=''; host.appendChild(wrap);
+  }catch(e){
+    host.textContent='Failed: ' + e.message;
+  }
+}
+
+/* ================================
+   Render table
+==================================*/
+function render(){
+  const tbody = $('tbody');
+  tbody.innerHTML = '';
+  for(const m of CURRENT){
+    const tr = document.createElement('tr');
+
+    const tdQ = document.createElement('td');
+    const end = parseIso(m.end_date);
+    const endTxt = end ? new Intl.DateTimeFormat(undefined,{year:'numeric',month:'short',day:'numeric'}).format(end) : '';
+    const chip = `<span class="chip">${m.src==='poly'?'Polymarket':'Myriad'}</span>`;
+    tdQ.innerHTML = `<div>${escapeHtml(m.question)} ${chip}</div>
+                     <div class="muted">${escapeHtml(m.slug||'')}${endTxt?` · ends ${endTxt}`:''}</div>`;
+    tr.appendChild(tdQ);
+
+    const tdId = document.createElement('td'); tdId.textContent = m.id; tr.appendChild(tdId);
+
+    const tdA = document.createElement('td');
+    tdA.innerHTML = `
+      <div class="muted">
+        <button data-act="out" data-src="${m.src}" data-id="${m.id}">Load outcomes</button>
+        <button data-act="liq" data-src="${m.src}" data-id="${m.id}">Load liquidity</button>
+        ${m.src==='poly' ? `<button data-act="ob" data-id="${m.id}">Polymarket orderbook</button>` : ``}
+      </div>
+      <div id="out-${m.src}-${m.id}" class="muted" style="margin-top:6px;">—</div>
+      <div id="liq-${m.src}-${m.id}" class="muted" style="margin-top:6px;"></div>
+      ${m.src==='poly' ? `<div id="ob-poly-${m.id}" class="muted" style="margin-top:6px;"></div>` : ``}
+    `;
+    tr.appendChild(tdA);
+
+    tbody.appendChild(tr);
+  }
+  const ps = parseInt($('pageSize').value,10)||100;
+  $('pageInfo').textContent = `Page ${LAST_COUNT ? (Math.floor(OFFSET/ps)+1) : 0}`;
+
+  tbody.querySelectorAll('button[data-act]').forEach(btn=>{
+    const act = btn.getAttribute('data-act');
+    if(act==='out'){
+      btn.onclick = ()=> loadOutcomes(btn.getAttribute('data-src'), btn.getAttribute('data-id'));
+    }else if(act==='liq'){
+      btn.onclick = ()=> loadLiquidity(btn.getAttribute('data-src'), btn.getAttribute('data-id'));
+    }else if(act==='ob'){
+      btn.onclick = ()=> loadPmOrderbook(btn.getAttribute('data-id'));
+    }
+  });
+}
+
+/* ================================
+   Pairing by names (dropdowns)
+==================================*/
+let POLY_NAME_IDX = []; // [{id,title}]
+let MYR_NAME_IDX  = []; // [{id,title}]
+let CUR_POLY_ID = "";
+let CUR_MYR_ID  = "";
+let OUTCOME_MAP = [];   // [{poly:"Yes", myriad:"No"}]
+
+function setOutcomePreview(){
+  $('outcomeMapPreview').textContent = 'Outcome map: ' + JSON.stringify(OUTCOME_MAP, null, 0);
+}
+
+async function loadAllNamesFor(source){
+  // pull names in pages
+  const out = [];
+  let offset = 0; const limit = 500;
+  while(true){
+    const data = await apiGet(`/markets?src=${source}&q=&limit=${limit}&offset=${offset}`);
+    const arr = data.markets || [];
+    if(!arr.length) break;
+    for(const m of arr){ out.push({id:String(m.id), title:String(m.question||'')}); }
+    if(arr.length < limit) break;
+    offset += limit;
+    // small UI yield
+    await new Promise(r=>setTimeout(r, 20));
+  }
+  return out;
+}
+
+async function fillNameDropdowns(){
+  $('pairMsg').textContent = 'Loading name lists…';
+  try{
+    POLY_NAME_IDX = await loadAllNamesFor('poly');
+    MYR_NAME_IDX  = await loadAllNamesFor('myriad');
+    const ps = $('polyTitleSel'); ps.innerHTML='';
+    const ms = $('myrTitleSel');  ms.innerHTML='';
+    ps.appendChild(new Option('-- choose Polymarket market --',''));
+    for(const x of POLY_NAME_IDX){ ps.appendChild(new Option(x.title, x.id)); }
+    ms.appendChild(new Option('-- choose Myriad market --',''));
+    for(const x of MYR_NAME_IDX){ ms.appendChild(new Option(x.title, x.id)); }
+    $('pairMsg').textContent = `Loaded ${POLY_NAME_IDX.length} Polymarket & ${MYR_NAME_IDX.length} Myriad titles.`; $('pairMsg').className='muted ok';
+  }catch(e){
+    $('pairMsg').textContent = 'Failed to load names: '+e.message; $('pairMsg').className='muted err';
+  }
+}
+
+$('loadNameLists').onclick = fillNameDropdowns;
+
+$('polyTitleSel').onchange = async (e)=>{
+  CUR_POLY_ID = e.target.value || '';
+  OUTCOME_MAP = []; setOutcomePreview();
+  if(!CUR_POLY_ID){ $('polyOutSel').innerHTML=''; return; }
+  try{
+    const data = await apiGet(`/outcomes?src=poly&market_id=${encodeURIComponent(CUR_POLY_ID)}`);
+    const outs = data.outcomes || [];
+    const sel = $('polyOutSel'); sel.innerHTML='';
+    sel.appendChild(new Option('-- poly outcome --',''));
+    for(const o of outs){ sel.appendChild(new Option(o.label||o.outcome_id, o.label||o.outcome_id)); }
+  }catch{ $('polyOutSel').innerHTML=''; }
+};
+$('myrTitleSel').onchange = async (e)=>{
+  CUR_MYR_ID = e.target.value || '';
+  OUTCOME_MAP = []; setOutcomePreview();
+  if(!CUR_MYR_ID){ $('myrOutSel').innerHTML=''; return; }
+  try{
+    const data = await apiGet(`/outcomes?src=myriad&market_id=${encodeURIComponent(CUR_MYR_ID)}`);
+    const outs = data.outcomes || [];
+    const sel = $('myrOutSel'); sel.innerHTML='';
+    sel.appendChild(new Option('-- myriad outcome --',''));
+    for(const o of outs){ sel.appendChild(new Option(o.label||o.outcome_id, o.label||o.outcome_id)); }
+  }catch{ $('myrOutSel').innerHTML=''; }
+};
+
+$('addOutcomePair').onclick = ()=>{
+  const p = $('polyOutSel').value;
+  const m = $('myrOutSel').value;
+  if(!p || !m){ $('pairMsg').textContent='Pick both outcomes first.'; $('pairMsg').className='muted err'; return; }
+  OUTCOME_MAP.push({ poly:p, myriad:m });
+  setOutcomePreview();
+};
+
+async function refreshPairsTable(){
+  const table = $('pairTable'), msgEl = $('pairMsg');
+  try{
+    const data = await apiGet('/pairs');
+    const pairs = data.pairs || [];
+    table.innerHTML='';
+    for(const p of pairs){
+      const tr = document.createElement('tr');
+      const map = (p.map || (p.map_json? JSON.parse(p.map_json): [])) || [];
+      tr.innerHTML = `<td>${escapeHtml(String(p.poly_id||p.polyId))}</td>
+                      <td>${escapeHtml(String(p.myriad_id||p.myriadId))}</td>
+                      <td>${escapeHtml(p.direction||'same')}</td>
+                      <td><code>${escapeHtml(JSON.stringify(map))}</code></td>
+                      <td>${escapeHtml(p.notes||'')}</td>
+                      <td class="muted">${escapeHtml(p.updated_at||p.at||'')}</td>`;
+      table.appendChild(tr);
+    }
+    msgEl.textContent = `${pairs.length} pairs`; msgEl.className='muted ok';
+  }catch(e){ msgEl.textContent='Failed to fetch pairs'; msgEl.className='muted err'; }
+}
+$('pairRefresh').onclick = refreshPairsTable;
+
+$('savePair').onclick = async ()=>{
+  const msgEl = $('pairMsg');
+  if(!CUR_POLY_ID || !CUR_MYR_ID){ msgEl.textContent='Choose both markets first.'; msgEl.className='muted err'; return; }
+  try{
+    const payload = {
+      polyId: CUR_POLY_ID,
+      myriadId: CUR_MYR_ID,
+      direction: $('pairDir').value,
+      map: OUTCOME_MAP,
+      notes: $('pairNotes').value.trim()
+    };
+    if(!getToken()){ msgEl.textContent='Set admin token and click “Use in this tab”.'; msgEl.className='muted err'; return; }
+    // Use PUT upsert for idempotency
+    await apiPost(`/admin/pairs`, payload, true);
+    msgEl.textContent='Saved pair.'; msgEl.className='muted ok';
+    OUTCOME_MAP = []; setOutcomePreview();
+    await refreshPairsTable();
+  }catch(e){
+    msgEl.textContent='Save failed: '+e.message; msgEl.className='muted err';
+  }
+};
+
+(function initPairAuth(){
+  const tokEl = $('pairTok'), useBtn = $('pairUse'), authMsg = $('pairAuthMsg');
   (function hydrate(){
     const savedBase = sget('PAIR_BASE'); if (savedBase) $('workerBase').value = savedBase;
     const savedTok  = sget('PAIR_TOKEN'); if (savedTok) { tokEl.value = savedTok; $('topAdminTok').value = savedTok; }
   })();
-
   useBtn.onclick = ()=>{ sset('PAIR_BASE', getBase()); sset('PAIR_TOKEN', tokEl.value.trim() || $('topAdminTok').value.trim()); authMsg.textContent='Token set for this tab.'; authMsg.className='muted ok'; };
-
-  function parseMap(){
-    const t = mapEl.value.trim();
-    if(!t) return [];
-    try { const j = JSON.parse(t); return Array.isArray(j)?j:[]; } catch(e){ throw new Error('Invalid outcome map JSON'); }
-  }
-
-  async function refresh(){
-    try{
-      msgEl.textContent='Loading…'; msgEl.className='muted';
-      const data = await apiGet('/pairs');
-      const pairs = data.pairs || [];
-      table.innerHTML='';
-      for(const p of pairs){
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${p.poly_id || p.polyId}</td>
-                        <td>${p.myriad_id || p.myriadId}</td>
-                        <td>${p.direction||'same'}</td>
-                        <td><code>${escapeHtml(JSON.stringify(p.map||JSON.parse(p.map_json||'[]')))}</code></td>
-                        <td>${escapeHtml(p.notes||'')}</td>
-                        <td class="muted">${escapeHtml(p.updated_at||p.at||'')}</td>
-                        <td><button data-edit="${p.poly_id || p.polyId}|${p.myriad_id || p.myriadId}">Edit</button></td>`;
-        table.appendChild(tr);
-      }
-      table.querySelectorAll('button[data-edit]').forEach(btn=>{
-        btn.onclick = ()=>{
-          const [polyId,myriadId] = btn.getAttribute('data-edit').split('|');
-          const p = (pairs||[]).find(x => String(x.poly_id||x.polyId)===polyId && String(x.myriad_id||x.myriadId)===myriadId);
-          if(!p) return;
-          polyEl.value = p.poly_id || p.polyId;
-          myrEl.value  = p.myriad_id || p.myriadId;
-          dirEl.value  = p.direction || 'same';
-          mapEl.value  = JSON.stringify(p.map || JSON.parse(p.map_json||'[]'), null, 2);
-          notesEl.value= p.notes || '';
-          window.scrollTo({ top:0, behavior:'smooth' });
-        };
-      });
-      msgEl.textContent = `${pairs.length} pairs`; msgEl.className='muted ok';
-    }catch(e){ msgEl.textContent='Failed to fetch'; msgEl.className='muted err'; }
-  }
-
-  async function create(){
-    try{
-      const payload = { polyId: polyEl.value.trim(), myriadId: myrEl.value.trim(), direction: dirEl.value, map: parseMap(), notes: notesEl.value.trim() };
-      if(!payload.polyId || !payload.myriadId) throw new Error('polyId and myriadId required');
-      await apiPost('/admin/pairs', payload, true);
-      msgEl.textContent='Created.'; msgEl.className='muted ok'; await refresh();
-    }catch(e){ msgEl.textContent=e.message; msgEl.className='muted err'; }
-  }
-  async function upsert(){
-    try{
-      const polyId = polyEl.value.trim(), myriadId = myrEl.value.trim();
-      if(!polyId || !myriadId) throw new Error('polyId and myriadId required');
-      await apiPut(`/admin/pairs/${encodeURIComponent(polyId)}/${encodeURIComponent(myriadId)}`, {
-        direction: dirEl.value, map: parseMap(), notes: notesEl.value.trim()
-      }, true);
-      msgEl.textContent='Upserted.'; msgEl.className='muted ok'; await refresh();
-    }catch(e){ msgEl.textContent=e.message; msgEl.className='muted err'; }
-  }
-  async function del(){
-    try{
-      const polyId = polyEl.value.trim(), myriadId = myrEl.value.trim();
-      if(!polyId || !myriadId) throw new Error('polyId and myriadId required');
-      await apiDel(`/admin/pairs/${encodeURIComponent(polyId)}/${encodeURIComponent(myriadId)}`, true);
-      msgEl.textContent='Deleted.'; msgEl.className='muted ok'; await refresh();
-    }catch(e){ msgEl.textContent=e.message; msgEl.className='muted err'; }
-  }
-
-  $('pairCreate').onclick = create;
-  $('pairUpsert').onclick = upsert;
-  $('pairDelete').onclick = del;
-  $('pairRefresh').onclick = refresh;
-  refresh();
 })();
+
+/* ================================
+   Export all market names -> .txt
+==================================*/
+async function exportNamesTxt(){
+  const lines = [];
+  for(const src of ['poly','myriad']){
+    let offset = 0; const limit = 500;
+    // fetch all pages
+    // (if DB is huge, adjust limit or add a safe max page count)
+    while(true){
+      const data = await apiGet(`/markets?src=${src}&q=&limit=${limit}&offset=${offset}`);
+      const arr = data.markets || [];
+      if(!arr.length) break;
+      for(const m of arr){
+        lines.push(`${m.question} (${src==='poly'?'Polymarket':'Myriad'})`);
+      }
+      if(arr.length < limit) break;
+      offset += limit;
+      await new Promise(r=>setTimeout(r,20));
+    }
+  }
+  const blob = new Blob([lines.join('\n')], {type:'text/plain;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'market_names.txt';
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 1000);
+}
+$('btnExportNames').onclick = exportNamesTxt;
 
 /* ================================
    Events: list loading + paging
@@ -472,12 +648,12 @@ $('q').addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ OFFSET=0; loadFro
 $('workerBase').addEventListener('change', ()=> sset('PAIR_BASE', getBase()));
 $('topAdminTok').addEventListener('change', ()=> sset('PAIR_TOKEN', $('topAdminTok').value.trim()));
 
-// Initial hydrate
+// Initial hydrate + first load
 (function init(){
   const savedBase = sget('PAIR_BASE'); if (savedBase) $('workerBase').value = savedBase;
   const savedTok  = sget('PAIR_TOKEN'); if (savedTok) { $('topAdminTok').value = savedTok; $('pairTok').value = savedTok; }
-  // Auto-load current source
   loadFromDb();
+  refreshPairsTable();
 })();
 </script>
 </body>
