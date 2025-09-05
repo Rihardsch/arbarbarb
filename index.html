@@ -1,428 +1,111 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Market Explorer (D1-backed)</title>
-<style>
-  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:16px; }
-  h1 { margin:0 0 12px; font-size:28px; }
-  .muted { opacity:.7; font-size:12px; }
-  .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:10px 0; }
-  input,button,select { padding:6px 8px; font-size:14px; }
-  input[type="text"], input[type="password"] { min-width:220px; }
-  table { width:100%; border-collapse:collapse; }
-  th,td { padding:8px; border-bottom:1px solid #e9e9e9; vertical-align:top; text-align:left; }
-  .chip{ display:inline-block; padding:2px 6px; border-radius:999px; background:#eef7ff; font-size:12px; margin-left:6px; }
-  .mini { width:100%; border-collapse:collapse; font-size:12px; margin-top:6px; }
-  .mini th,.mini td { padding:4px 6px; border-bottom:1px dashed #efefef; }
-  .nowrap{ white-space:nowrap; }
-  details { margin-top:6px; }
-  .ok { color:#137333; }
-  .err{ color:#b00020; }
-</style>
-</head>
-<body>
-
-<h1>Market Explorer <span class="muted">(stored in D1)</span></h1>
-
-<div class="controls">
-  <label>Worker:
-    <input id="workerBase" type="text" value="https://arbarbarb.rihardschnr2.workers.dev" style="width:420px;">
-  </label>
-
-  <label>Source:
-    <select id="source">
-      <option value="poly">Polymarket</option>
-      <option value="myriad" selected>Myriad</option>
-    </select>
-  </label>
-
-  <label>Filter:
-    <input id="q" type="text" placeholder="search question/slug/title">
-  </label>
-
-  <label>Page size:
-    <select id="pageSize"><option>25</option><option>50</option><option selected>100</option><option>200</option></select>
-  </label>
-
-  <button id="btnLoadFromDb">Load from DB</button>
-  <span id="dbStatus" class="muted">Loading from D1…</span>
-</div>
-
-<div class="controls">
-  <label>Admin token:
-    <input id="topAdminTok" type="password" placeholder="ADMIN_TOKEN">
-  </label>
-  <button id="btnIngestPoly">Ingest Polymarket → D1</button>
-  <button id="btnIngestMyriad">Ingest Myriad → D1</button>
-  <span id="ingMsg" class="muted"></span>
-</div>
-
-<hr/>
-
-<div class="controls">
-  <button id="prevBtn">← Prev</button>
-  <span id="pageInfo" class="muted">Page 0 of 0</span>
-  <button id="nextBtn">Next →</button>
-</div>
-
-<table>
-  <thead>
-    <tr>
-      <th>Question / Title</th>
-      <th class="nowrap">Market ID</th>
-      <th>Outcomes</th>
-    </tr>
-  </thead>
-  <tbody id="tbody"></tbody>
-</table>
-
-<hr/>
-
-<h3>Pairs Admin <span class="muted">(Polymarket ↔ Myriad)</span></h3>
-
-<div class="controls">
-  <label>Admin token:
-    <input id="pairTok" type="password" placeholder="paste ADMIN_TOKEN">
-  </label>
-  <button id="pairUse">Use in this tab</button>
-  <span id="pairAuthMsg" class="muted"></span>
-</div>
-
-<div class="controls">
-  <label>Polymarket ID: <input id="pairPoly" placeholder="e.g. 516710" style="width:160px;"></label>
-  <label>Myriad ID: <input id="pairMyriad" placeholder="e.g. 134" style="width:160px;"></label>
-  <label>Direction:
-    <select id="pairDir">
-      <option value="same">same</option>
-      <option value="inverse">inverse</option>
-    </select>
-  </label>
-</div>
-
-<div class="controls">
-  <label>Outcome map (JSON):
-    <input id="pairMap" placeholder='[{"poly":"Yes","myriad":"≥ $125K"},{"poly":"No","myriad":"≤ $105K"}]' style="width:560px;">
-  </label>
-  <label>Notes: <input id="pairNotes" style="width:260px;"></label>
-</div>
-
-<div class="controls">
-  <button id="pairCreate">Create</button>
-  <button id="pairUpsert">Upsert</button>
-  <button id="pairDelete" style="background:#fee;border:1px solid #f99;">Delete</button>
-  <button id="pairRefresh">Refresh list</button>
-  <span id="pairMsg" class="muted"></span>
-</div>
-
-<table class="mini" style="width:100%;">
-  <thead><tr><th>Polymarket</th><th>Myriad</th><th>Dir</th><th>Map</th><th>Notes</th><th>Updated</th><th></th></tr></thead>
-  <tbody id="pairTable"></tbody>
-</table>
-
 <script>
-/* ================================
-   Small helpers
-==================================*/
-const $ = id => document.getElementById(id);
-const sset = (k,v)=>sessionStorage.setItem(k,v);
-const sget = (k)=>sessionStorage.getItem(k)||"";
-function escapeHtml(s){ return (s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function parseIso(s){ const d=s?new Date(s):null; return isFinite(d)?d:null; }
-function getBase(){ return ($('workerBase').value||'').replace(/\/+$/,''); }
-function getToken(){ return sget('PAIR_TOKEN') || $('topAdminTok').value || $('pairTok').value || ''; }
-const pf = (x,dp=6)=> (x==null?'—':Number(x).toFixed(dp));
+// ================================
+// Browser → Polymarket → Worker (hybrid ingest)
+// ================================
+const POLY_GAMMA = "https://gamma-api.polymarket.com";
 
-/* ================================
-   Global state for list view
-==================================*/
-let OFFSET = 0;
-let LAST_COUNT = 0;
-let CURRENT = []; // markets slice for current page
-let TOTAL_SHOWN = 0; // not known; we paginate with offset only
-
-/* ================================
-   API callers
-==================================*/
-async function apiGet(path){
-  const url = getBase() + path;
-  const r = await fetch(url, { method: 'GET' });
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-  return r.json();
-}
-async function apiPost(path, body=null, auth=false){
-  const url = getBase() + path;
-  const headers = { 'Content-Type':'application/json' };
-  if (auth) headers['Authorization'] = 'Bearer ' + getToken();
-  const r = await fetch(url, { method:'POST', headers, body: body ? JSON.stringify(body) : undefined });
-  const ct = r.headers.get('content-type')||'';
-  const data = ct.includes('json') ? await r.json() : await r.text();
-  if (!r.ok || (data && data.ok === false)) {
-    const msg = (data && data.error) || r.statusText || 'Request failed';
-    throw new Error(msg);
+/** try direct; if CORS blocks, fall back to worker proxy:  GET {worker}?url=... */
+async function gammaFetch(url) {
+  try {
+    const r = await fetch(url, { headers: { accept: "application/json" }});
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  } catch (e) {
+    // fallback via worker proxy (your worker already allows this host)
+    const proxied = `${getBase()}?url=${encodeURIComponent(url)}`;
+    const r2 = await fetch(proxied, { headers: { accept: "application/json" }});
+    if (!r2.ok) throw new Error(`Proxy HTTP ${r2.status}`);
+    return await r2.json();
   }
-  return data;
-}
-async function apiPut(path, body, auth=true){
-  const url = getBase() + path;
-  const headers = { 'Content-Type':'application/json' };
-  if (auth) headers['Authorization'] = 'Bearer ' + getToken();
-  const r = await fetch(url, { method:'PUT', headers, body: JSON.stringify(body) });
-  const data = await r.json().catch(()=>({}));
-  if (!r.ok || data.ok === false) throw new Error((data && data.error) || r.statusText);
-  return data;
-}
-async function apiDel(path, auth=true){
-  const url = getBase() + path;
-  const headers = {};
-  if (auth) headers['Authorization'] = 'Bearer ' + getToken();
-  const r = await fetch(url, { method:'DELETE', headers });
-  const data = await r.json().catch(()=>({}));
-  if (!r.ok || data.ok === false) throw new Error((data && data.error) || r.statusText);
-  return data;
 }
 
-/* ================================
-   Ingest buttons (chunked Poly)
-==================================*/
-async function ingestPolyInChunks({ limit=400, max=1200 } = {}){
+/** POST one JSON chunk to the worker, which only writes to D1 */
+async function postPolyChunkToWorker(marketsChunk) {
+  // keep payload small—only fields Worker needs
+  const slim = marketsChunk.map(m => ({
+    id: String(m.id),
+    question: m.question,
+    slug: m.slug,
+    endDateIso: m.endDateIso ?? m.endDate ?? null,
+    outcomes: Array.isArray(m.outcomes) ? m.outcomes : (typeof m.outcomes === "string" ? (()=>{try{return JSON.parse(m.outcomes)}catch{return []}})() : []),
+    raw: m, // optional: if your worker stores full JSON; remove if not
+  }));
+  return apiPost('/admin/ingest/polyPage', { markets: slim }, true);
+}
+
+/**
+ * Hybrid ingest:
+ * - Browser fetches Polymarket gamma pages
+ * - Sends them to Worker in small POSTs
+ * - Concurrency is for *gamma* page downloads only (safe in browser)
+ */
+async function ingestPolymarketFromBrowser({
+  limit = 400,         // gamma page size
+  max = 2000,          // maximum rows to fetch overall
+  concurrency = 3,     // parallel gamma pages
+  postChunk = 200      // how many markets per POST to worker
+} = {}) {
   const out = $('ingMsg');
-  if(!getBase() || !getToken()){ out.textContent='Set worker URL and admin token first.'; out.className='muted err'; return; }
-  out.textContent='Ingesting Polymarket…'; out.className='muted';
-  let offset = 0, totalStored = 0;
-  try{
-    while(offset < max){
-      const res = await apiPost(`/admin/ingest/poly?limit=${limit}&offset=${offset}&max=${max}`, null, true);
-      totalStored += res.stored || 0;
-      out.textContent = `Ingest batch: +${res.stored||0} (total ${totalStored})`;
-      offset = (res.nextOffset ?? (offset + limit));
-      if ((res.received||0) < limit) break;
+  if (!getBase()) { out.textContent = 'Set Worker URL first.'; out.className='muted err'; return; }
+  if (!getToken()) { out.textContent = 'Paste your ADMIN_TOKEN first.'; out.className='muted err'; return; }
+
+  out.textContent = 'Fetching Polymarket…'; out.className='muted';
+
+  // build a queue of offsets (0, limit, 2*limit, …) up to max
+  const offsets = [];
+  for (let off = 0; off < max; off += limit) offsets.push(off);
+
+  let totalReceived = 0;
+  let totalStored   = 0;
+  let stopEarly     = false;
+
+  async function processOffset(offset) {
+    if (stopEarly) return;
+    const url = `${POLY_GAMMA}/markets?closed=false&limit=${limit}&offset=${offset}`;
+    const page = await gammaFetch(url);
+    const rows = Array.isArray(page) ? page : [];
+
+    // if we got less than asked, likely the end—signal other workers to stop after current run
+    if (rows.length < limit) stopEarly = true;
+
+    // filter out expired/closed on the client too (just to shrink payloads)
+    const today = new Date(); today.setHours(0,0,0,0);
+    const fresh = rows.filter(g => {
+      const end = g.endDateIso || g.endDate || null;
+      return (!end || new Date(end) >= today) && !g.closed;
+    });
+
+    totalReceived += rows.length;
+
+    // split into small POSTs so we never hit body size limits
+    for (let i = 0; i < fresh.length; i += postChunk) {
+      const slice = fresh.slice(i, i + postChunk);
+      if (!slice.length) continue;
+      const res = await postPolyChunkToWorker(slice);   // {ok, stored}
+      totalStored += (res?.stored || slice.length);
+      out.textContent = `Uploaded ${totalStored} (fetched ${totalReceived})…`;
     }
-    out.textContent = `Polymarket ingest done. Stored ${totalStored}.`; out.className='muted ok';
-    await loadFromDb();
-  }catch(e){
-    out.textContent = 'Error: ' + e.message; out.className='muted err';
   }
-}
-async function ingestMyriadOnce(){
-  const out = $('ingMsg');
-  if(!getBase() || !getToken()){ out.textContent='Set worker URL and admin token first.'; out.className='muted err'; return; }
-  out.textContent='Ingesting Myriad…'; out.className='muted';
-  try{
-    const res = await apiPost('/admin/ingest/myriad', null, true);
-    out.textContent = `Myriad ingest done. Stored ${res.stored||0}.`; out.className='muted ok';
-    await loadFromDb();
-  }catch(e){
-    out.textContent = 'Error: ' + e.message; out.className='muted err';
-  }
-}
 
-/* ================================
-   Load from DB (markets)
-==================================*/
-async function loadFromDb(){
-  $('dbStatus').textContent = 'Loading from D1…';
-  const src = $('source').value;
-  const q   = encodeURIComponent($('q').value || '');
-  const lim = parseInt($('pageSize').value, 10) || 100;
-  try{
-    const data = await apiGet(`/markets?src=${src}&q=${q}&limit=${lim}&offset=${OFFSET}`);
-    CURRENT = data.markets || [];
-    LAST_COUNT = CURRENT.length;
-    TOTAL_SHOWN += LAST_COUNT; // informational only
-    $('dbStatus').textContent = `${LAST_COUNT} markets from D1`;
-    render();
-  }catch(e){
-    $('dbStatus').textContent = 'Failed: ' + e.message;
-  }
-}
-
-/* ================================
-   Render + outcomes loader
-==================================*/
-function render(){
-  const tbody = $('tbody');
-  tbody.innerHTML = '';
-  for(const m of CURRENT){
-    const tr = document.createElement('tr');
-
-    const tdQ = document.createElement('td');
-    const end = parseIso(m.end_date);
-    const endTxt = end ? new Intl.DateTimeFormat(undefined,{year:'numeric',month:'short',day:'numeric'}).format(end) : '';
-    const chip = `<span class="chip">${m.src==='poly'?'Polymarket':'Myriad'}</span>`;
-    tdQ.innerHTML = `<div>${escapeHtml(m.question)} ${chip}</div>
-                     <div class="muted">${escapeHtml(m.slug||'')}${endTxt?` · ends ${endTxt}`:''}</div>`;
-    tr.appendChild(tdQ);
-
-    const tdId = document.createElement('td'); tdId.textContent = m.id; tr.appendChild(tdId);
-
-    const tdO = document.createElement('td');
-    tdO.innerHTML = `
-      <button data-load-out="${m.src}|${m.id}">Load outcomes</button>
-      <div id="out-${m.src}-${m.id}" class="muted" style="margin-top:6px;">—</div>`;
-    tr.appendChild(tdO);
-
-    tbody.appendChild(tr);
-  }
-  $('pageInfo').textContent = `Page ${LAST_COUNT ? (OFFSET / (parseInt($('pageSize').value,10)||100) + 1) : 0}`;
-  // wire outcomes buttons
-  tbody.querySelectorAll('button[data-load-out]').forEach(btn=>{
-    btn.onclick = () => {
-      const [src,id] = btn.getAttribute('data-load-out').split('|');
-      loadOutcomes(src,id);
-    };
+  // run with limited concurrency
+  const workers = new Array(concurrency).fill(null).map(async (_, i) => {
+    for (let k = i; k < offsets.length; k += concurrency) {
+      if (stopEarly) break;
+      await processOffset(offsets[k]);
+    }
   });
-}
 
-async function loadOutcomes(src, marketId){
-  const host = $(`out-${src}-${marketId}`);
-  if(!host) return;
-  host.textContent = 'Loading…';
-  try{
-    const data = await apiGet(`/outcomes?src=${encodeURIComponent(src)}&market_id=${encodeURIComponent(marketId)}`);
-    const outs = data.outcomes || [];
-    if(!outs.length){ host.textContent='No outcomes found.'; return; }
-    const tbl = document.createElement('table');
-    tbl.className='mini';
-    tbl.innerHTML = `<thead><tr><th>Outcome</th><th>Price</th><th>Shares</th><th>Holders</th></tr></thead><tbody></tbody>`;
-    const body = tbl.querySelector('tbody');
-    for(const o of outs){
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${escapeHtml(o.label||o.outcome_id||'')}</td>
-                      <td>${pf(o.price,6)}</td>
-                      <td>${o.shares==null?'—':Number(o.shares).toLocaleString()}</td>
-                      <td>${o.holders==null?'—':Number(o.holders).toLocaleString()}</td>`;
-      body.appendChild(tr);
-    }
-    host.innerHTML=''; host.appendChild(tbl);
-  }catch(e){
-    host.textContent = 'Failed: ' + e.message;
+  try {
+    await Promise.all(workers);
+    out.textContent = `Done. Stored ${totalStored} (received ${totalReceived}).`; out.className='muted ok';
+    OFFSET = 0;
+    await loadFromDb();
+  } catch (e) {
+    out.textContent = 'Error: ' + e.message; out.className='muted err';
   }
 }
 
-/* ================================
-   Pairs Admin (CRUD)
-==================================*/
-(function(){
-  const tokEl = $('pairTok'), useBtn = $('pairUse'), authMsg = $('pairAuthMsg');
-  const polyEl = $('pairPoly'), myrEl = $('pairMyriad'), dirEl = $('pairDir'), mapEl = $('pairMap'), notesEl = $('pairNotes');
-  const createBtn = $('pairCreate'), upsertBtn = $('pairUpsert'), delBtn = $('pairDelete'), refBtn = $('pairRefresh'), table = $('pairTable'), msgEl = $('pairMsg');
-
-  // Pre-fill from session
-  (function hydrate(){
-    const savedBase = sget('PAIR_BASE'); if (savedBase) $('workerBase').value = savedBase;
-    const savedTok  = sget('PAIR_TOKEN'); if (savedTok) { tokEl.value = savedTok; $('topAdminTok').value = savedTok; }
-  })();
-
-  useBtn.onclick = ()=>{ sset('PAIR_BASE', getBase()); sset('PAIR_TOKEN', tokEl.value.trim() || $('topAdminTok').value.trim()); authMsg.textContent='Token set for this tab.'; authMsg.className='muted ok'; };
-
-  function parseMap(){
-    const t = mapEl.value.trim();
-    if(!t) return [];
-    try { const j = JSON.parse(t); return Array.isArray(j)?j:[]; } catch(e){ throw new Error('Invalid outcome map JSON'); }
-  }
-
-  async function refresh(){
-    try{
-      msgEl.textContent='Loading…'; msgEl.className='muted';
-      const data = await apiGet('/pairs');
-      const pairs = data.pairs || [];
-      table.innerHTML='';
-      for(const p of pairs){
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${p.poly_id || p.polyId}</td>
-                        <td>${p.myriad_id || p.myriadId}</td>
-                        <td>${p.direction||'same'}</td>
-                        <td><code>${escapeHtml(JSON.stringify(p.map||JSON.parse(p.map_json||'[]')))}</code></td>
-                        <td>${escapeHtml(p.notes||'')}</td>
-                        <td class="muted">${escapeHtml(p.updated_at||p.at||'')}</td>
-                        <td><button data-edit="${p.poly_id || p.polyId}|${p.myriad_id || p.myriadId}">Edit</button></td>`;
-        table.appendChild(tr);
-      }
-      table.querySelectorAll('button[data-edit]').forEach(btn=>{
-        btn.onclick = ()=>{
-          const [polyId,myriadId] = btn.getAttribute('data-edit').split('|');
-          const p = (pairs||[]).find(x => String(x.poly_id||x.polyId)===polyId && String(x.myriad_id||x.myriadId)===myriadId);
-          if(!p) return;
-          polyEl.value = p.poly_id || p.polyId;
-          myrEl.value  = p.myriad_id || p.myriadId;
-          dirEl.value  = p.direction || 'same';
-          mapEl.value  = JSON.stringify(p.map || JSON.parse(p.map_json||'[]'), null, 2);
-          notesEl.value= p.notes || '';
-          window.scrollTo({ top:0, behavior:'smooth' });
-        };
-      });
-      msgEl.textContent = `${pairs.length} pairs`; msgEl.className='muted ok';
-    }catch(e){ msgEl.textContent='Failed to fetch'; msgEl.className='muted err'; }
-  }
-
-  async function create(){
-    try{
-      const payload = { polyId: polyEl.value.trim(), myriadId: myrEl.value.trim(), direction: dirEl.value, map: parseMap(), notes: notesEl.value.trim() };
-      if(!payload.polyId || !payload.myriadId) throw new Error('polyId and myriadId required');
-      await apiPost('/admin/pairs', payload, true);
-      msgEl.textContent='Created.'; msgEl.className='muted ok'; await refresh();
-    }catch(e){ msgEl.textContent=e.message; msgEl.className='muted err'; }
-  }
-  async function upsert(){
-    try{
-      const polyId = polyEl.value.trim(), myriadId = myrEl.value.trim();
-      if(!polyId || !myriadId) throw new Error('polyId and myriadId required');
-      await apiPut(`/admin/pairs/${encodeURIComponent(polyId)}/${encodeURIComponent(myriadId)}`, {
-        direction: dirEl.value, map: parseMap(), notes: notesEl.value.trim()
-      }, true);
-      msgEl.textContent='Upserted.'; msgEl.className='muted ok'; await refresh();
-    }catch(e){ msgEl.textContent=e.message; msgEl.className='muted err'; }
-  }
-  async function del(){
-    try{
-      const polyId = polyEl.value.trim(), myriadId = myrEl.value.trim();
-      if(!polyId || !myriadId) throw new Error('polyId and myriadId required');
-      await apiDel(`/admin/pairs/${encodeURIComponent(polyId)}/${encodeURIComponent(myriadId)}`, true);
-      msgEl.textContent='Deleted.'; msgEl.className='muted ok'; await refresh();
-    }catch(e){ msgEl.textContent=e.message; msgEl.className='muted err'; }
-  }
-
-  $('pairCreate').onclick = create;
-  $('pairUpsert').onclick = upsert;
-  $('pairDelete').onclick = del;
-  $('pairRefresh').onclick = refresh;
-  refresh();
-})();
-
-/* ================================
-   Events: list loading + paging
-==================================*/
-$('btnIngestPoly').onclick   = ()=>ingestPolyInChunks({ limit: 400, max: 1200 });
-$('btnIngestMyriad').onclick = ingestMyriadOnce;
-$('btnLoadFromDb').onclick   = ()=>{ OFFSET = 0; loadFromDb(); };
-
-$('prevBtn').onclick = ()=>{
-  const ps = parseInt($('pageSize').value, 10) || 100;
-  OFFSET = Math.max(0, OFFSET - ps);
-  loadFromDb();
-};
-$('nextBtn').onclick = ()=>{
-  const ps = parseInt($('pageSize').value, 10) || 100;
-  OFFSET = OFFSET + ps;
-  loadFromDb();
-};
-
-$('source').onchange = ()=>{ OFFSET = 0; loadFromDb(); };
-$('pageSize').onchange = ()=>{ OFFSET = 0; loadFromDb(); };
-$('q').addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ OFFSET=0; loadFromDb(); } });
-
-// Persist worker base + token when changed
-$('workerBase').addEventListener('change', ()=> sset('PAIR_BASE', getBase()));
-$('topAdminTok').addEventListener('change', ()=> sset('PAIR_TOKEN', $('topAdminTok').value.trim()));
-
-// Initial hydrate + first load
-(function init(){
-  const savedBase = sget('PAIR_BASE'); if (savedBase) $('workerBase').value = savedBase;
-  const savedTok  = sget('PAIR_TOKEN'); if (savedTok) { $('topAdminTok').value = savedTok; $('pairTok').value = savedTok; }
-  $('dbStatus').textContent = '0 markets from D1';
-})();
+// ---- wire the button to the new flow
+$('btnIngestPoly').onclick = () =>
+  ingestPolymarketFromBrowser({ limit: 400, max: 2000, concurrency: 3, postChunk: 200 });
 </script>
-</body>
-</html>
